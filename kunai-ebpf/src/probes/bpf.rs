@@ -1,14 +1,26 @@
 use super::*;
-use aya_ebpf::{maps::LruHashMap, programs::ProbeContext};
+use aya_ebpf::{
+    cty::c_int,
+    maps::LruHashMap,
+    programs::{ProbeContext, RetProbeContext},
+};
+use kunai_common::option::BpfOption;
 
 #[map]
 static mut BPF_PROG_TRACK: LruHashMap<u64, co_re::bpf_prog> = LruHashMap::with_max_entries(1024, 0);
 
-// this function gets called at the end of bpf_prog_load
-// and contains all useful information about program
-// being loaded
+/// this function gets called at the end of bpf_prog_load
+/// and contains all useful information about program
+/// being loaded
+///
+/// match-proto:v5.0:security/security.c:int security_bpf_prog(struct bpf_prog *prog)
+/// match-proto:latest:security/security.c:int security_bpf_prog(struct bpf_prog *prog)
 #[kprobe(function = "security_bpf_prog")]
 pub fn entry_security_bpf_prog(ctx: ProbeContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     match unsafe { try_security_bpf_prog(&ctx) } {
         Ok(_) => errors::BPF_PROG_SUCCESS,
         Err(s) => {
@@ -26,9 +38,17 @@ unsafe fn try_security_bpf_prog(ctx: &ProbeContext) -> ProbeResult<()> {
     Ok(())
 }
 
-// this probe gets executed after security_bpf_prog because of fexit
+/// this probe gets executed after security_bpf_prog because of fexit
+///
+/// match-proto:v5.0:kernel/bpf/syscall.c:static int bpf_prog_load(union bpf_attr *attr, union bpf_attr __user *uattr)
+/// match-proto:v5.14:kernel/bpf/syscall.c:static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr)
+/// match-proto:v6.4:kernel/bpf/syscall.c:static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 #[kretprobe(function = "bpf_prog_load")]
-pub fn exit_bpf_prog_load(ctx: ProbeContext) -> u32 {
+pub fn exit_bpf_prog_load(ctx: RetProbeContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     match unsafe { try_bpf_prog_load(&ctx) } {
         Ok(_) => errors::BPF_PROG_SUCCESS,
         Err(s) => {
@@ -38,8 +58,8 @@ pub fn exit_bpf_prog_load(ctx: ProbeContext) -> u32 {
     }
 }
 
-unsafe fn try_bpf_prog_load(ctx: &ProbeContext) -> ProbeResult<()> {
-    let rc = ctx.ret().unwrap_or(-1);
+unsafe fn try_bpf_prog_load(ctx: &RetProbeContext) -> ProbeResult<()> {
+    let rc: c_int = ctx.ret();
     let key = bpf_task_tracking_id();
 
     if let Some(bpf_prog) = BPF_PROG_TRACK.get(&key) {
@@ -61,7 +81,7 @@ unsafe fn try_bpf_prog_load(ctx: &ProbeContext) -> ProbeResult<()> {
         if let Some(p_name) = bpf_prog_aux.name() {
             ignore_result!(inspect_err!(
                 event.data.name.read_kernel_str_bytes(p_name),
-                |_| warn_msg!(ctx, "failed to read program name")
+                |_| warn!(ctx, "failed to read program name")
             ));
         }
 
@@ -72,14 +92,14 @@ unsafe fn try_bpf_prog_load(ctx: &ProbeContext) -> ProbeResult<()> {
         // needs to be implemented like that not to cause a read_ok! verifier error
         // on some kernels
         if let Some(vi) = bpf_prog_aux.verified_insns() {
-            event.data.verified_insns = Some(vi)
+            event.data.verified_insns = BpfOption::Some(vi)
         }
 
         // get attached_func_name
         if let Some(afn) = bpf_prog_aux.attach_func_name() {
             ignore_result!(inspect_err!(
                 event.data.attached_func_name.read_kernel_str_bytes(afn),
-                |_| warn_msg!(ctx, "failed to read attach_func_name")
+                |_| warn!(ctx, "failed to read attach_func_name")
             ));
         }
 
@@ -91,7 +111,7 @@ unsafe fn try_bpf_prog_load(ctx: &ProbeContext) -> ProbeResult<()> {
 
         pipe_event(ctx, event);
     } else {
-        error_msg!(ctx, "failed to retrieve BPF program load event")
+        error!(ctx, "failed to retrieve BPF program load event")
     }
 
     // we use a LruHashmap so we can safely ignore result

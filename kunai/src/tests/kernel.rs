@@ -4,12 +4,16 @@ use aya::VerifierLogLevel;
 use env_logger::Builder;
 use kunai::{
     config::Config,
+    kallsyms::KernelSymbols,
     util::{is_bpf_lsm_enabled, uname::Utsname},
 };
 use kunai_common::kernel;
-use libc::{rlimit, LINUX_REBOOT_CMD_POWER_OFF, RLIMIT_MEMLOCK, RLIM_INFINITY};
+use libc::{
+    makedev, mknod, rlimit, LINUX_REBOOT_CMD_POWER_OFF, RLIMIT_MEMLOCK, RLIM_INFINITY, S_IFCHR,
+    S_IRUSR, S_IWUSR,
+};
 use log::{error, info, warn};
-use std::{ffi::CString, panic};
+use std::{ffi::CString, panic, path::Path};
 
 fn mount(src: &str, target: &str, filesystem_type: &str) -> anyhow::Result<()> {
     // Paths and options
@@ -52,7 +56,7 @@ fn integration() -> anyhow::Result<()> {
     info!("mounting securityfs");
     mount("none", "/sys/kernel/security", "securityfs")?;
 
-    let conf = Config::default_hardened();
+    let mut conf = Config::default_hardened();
 
     if conf.harden {
         if current_kernel < kernel!(5, 7, 0) {
@@ -66,9 +70,17 @@ fn integration() -> anyhow::Result<()> {
         }
     }
 
+    let kernel_syms = KernelSymbols::from_sys().unwrap_or_default();
+
+    // we have lsm loading failure under aarch64 for kernel < 6.4.x
+    // https://blog.exein.io/exploring-bpf-lsm-support-on-aarch64-with-ftrace/
+    if cfg!(target_arch = "aarch64") && current_kernel < kernel!(6, 4, 0) {
+        conf.harden = false
+    }
+
     info!("loading ebpf bytes");
-    let mut bpf = kunai::prepare_bpf(current_kernel, &conf, verifier_level)?;
-    kunai::load_and_attach_bpf(&conf, current_kernel, &mut bpf)?;
+    let mut bpf = kunai::prepare_bpf(current_kernel, &kernel_syms, &conf, verifier_level)?;
+    kunai::load_and_attach_bpf(&conf, &kernel_syms, current_kernel, &mut bpf)?;
 
     Ok(())
 }
@@ -95,15 +107,34 @@ fn setrlimit(rlimit: &rlimit) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn custom_panic_handler(info: &panic::PanicInfo) {
+fn custom_panic_handler(info: &panic::PanicHookInfo) {
     // Your custom panic handling code goes here
     println!("\x1b[1;31m{info}\x1b[0m");
     // we power-off the system
     unsafe { libc::reboot(LINUX_REBOOT_CMD_POWER_OFF) };
 }
 
+fn mknode_urandom() -> anyhow::Result<()> {
+    let path = CString::new("/dev/urandom").expect("cannot create cstring");
+    let mode = S_IFCHR | S_IRUSR | S_IWUSR; // Character device with read/write permissions
+    let dev = makedev(1, 9); // Major 1, Minor 9 for /dev/urandom
+
+    let result = unsafe { mknod(path.as_ptr(), mode, dev as _) };
+
+    if result != 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
 fn main() -> ! {
     panic::set_hook(Box::new(custom_panic_handler));
+
+    if !Path::new("/dev/urandom").exists() {
+        println!("/dev/urandom does not exists, trying to create it");
+        mknode_urandom().unwrap();
+    }
 
     println!("initializing logger");
     // building the logger

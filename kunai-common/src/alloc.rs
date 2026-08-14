@@ -1,14 +1,13 @@
-use crate::macros::bpf_target_code;
-
-bpf_target_code! {
-    mod bpf;
-    pub use bpf::*;
-}
+#[cfg(target_arch = "bpf")]
+mod bpf;
+#[cfg(target_arch = "bpf")]
+pub use bpf::*;
 
 use kunai_macros::BpfError;
 
 use super::errors::ProbeError;
 
+#[repr(C)]
 #[derive(BpfError, Clone, Copy)]
 pub enum Error {
     #[error("failed to get allocator")]

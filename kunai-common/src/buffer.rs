@@ -1,15 +1,13 @@
 use core::cmp::min;
 
-use crate::{errors::ProbeError, macros::bpf_target_code, macros::not_bpf_target_code};
+use crate::errors::ProbeError;
 use kunai_macros::BpfError;
 
-not_bpf_target_code! {
-    mod user;
-}
+#[cfg(feature = "user")]
+mod user;
 
-bpf_target_code! {
-    mod bpf;
-}
+#[cfg(target_arch = "bpf")]
+mod bpf;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -93,6 +91,7 @@ impl<const N: usize> Buffer<N> {
     }
 }
 
+#[repr(C)]
 #[derive(BpfError, Clone, Copy)]
 pub enum Error {
     #[error("bpf_probe_read failed")]
@@ -134,8 +133,12 @@ pub enum Error {
     BvecOffsetMissing,
     #[error("bio_vec.bv_len missing")]
     BvecLenMissing,
+    #[error("bio_vec base is null")]
+    BvecNullBase,
     #[error("failed to read bio_vec")]
     FailedToReadBioVec,
+    #[error("Unsupported target arch")]
+    UnsupportedArch,
 }
 
 impl From<Error> for ProbeError {

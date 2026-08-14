@@ -6,27 +6,34 @@ use std::{
 };
 
 use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
-use gene::{Event, FieldGetter, FieldValue};
+use gene::{rules::MAX_SEVERITY, Event, FieldGetter, FieldNameIterator, FieldValue};
 use gene_derive::{Event, FieldGetter};
 
-use kunai_common::{bpf_events, net};
+use kunai_common::{
+    bpf_events::{self, TaskInfo},
+    net,
+};
 use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 use crate::{
     cache::{FileMeta, Hashes},
     containers::Container,
-    info::{ContainerInfo, StdEventInfo},
+    info::{ContainerInfo, StdEventInfo, TaskAdditionalInfo},
 };
+
+pub mod agent;
+mod start;
+pub use start::*;
 
 #[derive(Debug, Default, Serialize, Deserialize, FieldGetter)]
 pub struct File {
-    pub file: PathBuf,
+    pub path: PathBuf,
 }
 
 impl From<PathBuf> for File {
     fn from(value: PathBuf) -> Self {
-        Self { file: value }
+        Self { path: value }
     }
 }
 
@@ -61,17 +68,17 @@ pub struct EventSection {
     pub id: u32,
     pub name: String,
     pub uuid: String,
-    pub batch: usize,
+    pub batch: u64,
 }
 
 impl From<&StdEventInfo> for EventSection {
     fn from(value: &StdEventInfo) -> Self {
         Self {
             source: "kunai".into(),
-            id: value.info.etype.id(),
-            name: value.info.etype.to_string(),
-            uuid: value.info.uuid.into_uuid().hyphenated().to_string(),
-            batch: value.info.batch,
+            id: value.bpf.etype.id(),
+            name: value.bpf.etype.to_string(),
+            uuid: value.bpf.uuid.into_uuid().hyphenated().to_string(),
+            batch: value.bpf.batch,
         }
     }
 }
@@ -94,23 +101,29 @@ pub struct TaskSection {
     pub tgid: i32,
     pub guuid: String,
     pub uid: u32,
+    pub user: String,
     pub gid: u32,
+    pub group: String,
     pub namespaces: Option<NamespaceInfo>,
     #[serde(with = "u32_hex")]
     pub flags: u32,
+    pub zombie: bool,
 }
 
-impl From<kunai_common::bpf_events::TaskInfo> for TaskSection {
-    fn from(value: kunai_common::bpf_events::TaskInfo) -> Self {
+impl TaskSection {
+    pub fn from_task_info_with_addition(ti: TaskInfo, add: TaskAdditionalInfo) -> Self {
         Self {
-            name: value.comm_string(),
-            pid: value.pid,
-            tgid: value.tgid,
-            guuid: value.tg_uuid.into_uuid().hyphenated().to_string(),
-            uid: value.uid,
-            gid: value.gid,
-            namespaces: value.namespaces.map(|ns| ns.into()),
-            flags: value.flags,
+            name: ti.comm_string(),
+            pid: ti.pid,
+            tgid: ti.tgid,
+            guuid: ti.tg_uuid.into_uuid().hyphenated().to_string(),
+            uid: ti.uid,
+            user: add.user.map(|u| u.name).unwrap_or("?".into()),
+            gid: ti.gid,
+            group: add.group.map(|g| g.name).unwrap_or("?".into()),
+            namespaces: ti.namespaces.map(|ns| ns.into()).into(),
+            flags: ti.flags,
+            zombie: ti.zombie,
         }
     }
 }
@@ -145,7 +158,7 @@ impl<'de> Deserialize<'de> for UtcDateTime {
     {
         struct UtcDateTimeVisitor;
 
-        impl<'de> Visitor<'de> for UtcDateTimeVisitor {
+        impl Visitor<'_> for UtcDateTimeVisitor {
             type Value = UtcDateTime;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -166,9 +179,9 @@ impl<'de> Deserialize<'de> for UtcDateTime {
     }
 }
 
-impl FieldGetter for UtcDateTime {
-    fn get_from_iter(&self, i: core::slice::Iter<'_, std::string::String>) -> Option<FieldValue> {
-        if i.len() > 0 {
+impl<'f> FieldGetter<'f> for UtcDateTime {
+    fn get_from_iter(&'f self, i: FieldNameIterator) -> Option<FieldValue<'f>> {
+        if !i.is_terminal() {
             return None;
         }
         // currently return timestamp as millisecond, it might not be optimal
@@ -188,6 +201,12 @@ pub struct EventInfo {
 
 impl From<StdEventInfo> for EventInfo {
     fn from(value: StdEventInfo) -> Self {
+        let task =
+            TaskSection::from_task_info_with_addition(value.bpf.process, value.additional.task);
+
+        let parent_task =
+            TaskSection::from_task_info_with_addition(value.bpf.parent, value.additional.parent);
+
         Self {
             host: HostSection {
                 name: value.additional.host.name,
@@ -196,13 +215,13 @@ impl From<StdEventInfo> for EventInfo {
             },
             event: EventSection {
                 source: "kunai".into(),
-                id: value.info.etype.id(),
-                name: value.info.etype.to_string(),
-                uuid: value.info.uuid.into_uuid().hyphenated().to_string(),
-                batch: value.info.batch,
+                id: value.bpf.etype.id(),
+                name: value.bpf.etype.to_string(),
+                uuid: value.bpf.uuid.into_uuid().hyphenated().to_string(),
+                batch: value.bpf.batch,
             },
-            task: value.info.process.into(),
-            parent_task: value.info.parent.into(),
+            task,
+            parent_task,
             utc_time: value.utc_timestamp.into(),
         }
     }
@@ -239,8 +258,8 @@ macro_rules! impl_std_iocs {
     };
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, FieldGetter)]
-pub struct ScanResult {
+#[derive(Debug, Default, FieldGetter, Serialize, Deserialize, Clone, PartialEq)]
+pub struct Detection {
     /// union of the rule names matching the event
     #[getter(skip)]
     #[serde(skip_serializing_if = "HashSet::is_empty")]
@@ -261,31 +280,83 @@ pub struct ScanResult {
     #[getter(skip)]
     #[serde(skip_serializing_if = "HashSet::is_empty")]
     pub actions: HashSet<String>,
-    /// flag indicating whether a filter rule matched
-    #[serde(skip)]
-    pub filtered: bool,
-    /// total severity score (bounded to [MAX_SEVERITY](rules::MAX_SEVERITY))
+    /// total severity score (bounded to [`MAX_SEVERITY`])
     pub severity: u8,
 }
 
-impl From<gene::ScanResult> for ScanResult {
-    fn from(value: gene::ScanResult) -> Self {
-        ScanResult {
+impl From<gene::Detection<'_>> for Detection {
+    fn from(mut value: gene::Detection) -> Self {
+        Self {
             iocs: HashSet::new(),
-            rules: value.rules,
-            tags: value.tags,
-            attack: value.attack,
-            actions: value.actions,
-            filtered: value.filtered,
+            rules: value.rules.drain().map(|s| s.into_owned()).collect(),
+            tags: value.tags.drain().map(|s| s.into_owned()).collect(),
+            attack: value.attack.drain().map(|s| s.into_owned()).collect(),
+            actions: value.actions.drain().map(|s| s.into_owned()).collect(),
             severity: value.severity,
+        }
+    }
+}
+
+#[derive(Debug, Default, FieldGetter, Serialize, Deserialize, Clone, PartialEq)]
+pub struct Filter {
+    /// union of the rule names matching the event
+    #[getter(skip)]
+    pub rules: HashSet<String>,
+    /// union of tags defined in the rules matching the event
+    #[getter(skip)]
+    #[serde(skip_serializing_if = "HashSet::is_empty")]
+    pub tags: HashSet<String>,
+    /// union of actions defined in the rules matching the event
+    #[getter(skip)]
+    #[serde(skip_serializing_if = "HashSet::is_empty")]
+    pub actions: HashSet<String>,
+}
+
+impl From<gene::Filter<'_>> for Filter {
+    fn from(mut value: gene::Filter) -> Self {
+        Self {
+            rules: value.rules.drain().map(|s| s.into_owned()).collect(),
+            tags: value.tags.drain().map(|s| s.into_owned()).collect(),
+            actions: value.actions.drain().map(|s| s.into_owned()).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, FieldGetter)]
+pub struct ScanResult {
+    pub detection: Option<Detection>,
+    pub filter: Option<Filter>,
+}
+
+impl From<gene::ScanResult<'_>> for ScanResult {
+    fn from(value: gene::ScanResult) -> Self {
+        Self {
+            detection: value.detection.take_include().map(Detection::from),
+            filter: value.filter.take_include().map(Filter::from),
         }
     }
 }
 
 impl ScanResult {
     #[inline(always)]
+    pub fn contains_detection<S: AsRef<str>>(&self, rule: S) -> bool {
+        self.detection
+            .as_ref()
+            .map(|d| d.rules.contains(rule.as_ref()))
+            .unwrap_or_default()
+    }
+
+    #[inline(always)]
+    pub fn contains_filter<S: AsRef<str>>(&self, rule: S) -> bool {
+        self.filter
+            .as_ref()
+            .map(|f| f.rules.contains(rule.as_ref()))
+            .unwrap_or_default()
+    }
+
+    #[inline(always)]
     pub fn is_detection(&self) -> bool {
-        !(self.rules.is_empty() && self.iocs.is_empty())
+        self.detection.is_some()
     }
 
     #[inline(always)]
@@ -295,13 +366,36 @@ impl ScanResult {
 
     #[inline(always)]
     pub fn is_filtered(&self) -> bool {
-        self.filtered
+        self.filter.is_some()
+    }
+
+    #[inline(always)]
+    pub fn severity(&self) -> u8 {
+        self.detection
+            .as_ref()
+            .map(|d| d.severity)
+            .unwrap_or_default()
+    }
+
+    #[inline]
+    pub fn update_iocs<S: AsRef<str>>(&mut self, iocs: impl Iterator<Item = (S, u8)>) {
+        let detections = self.detection.get_or_insert_default();
+
+        iocs.for_each(|(ioc, sev)| {
+            detections.iocs.insert(ioc.as_ref().to_string());
+            detections.severity =
+                (sev.clamp(0, MAX_SEVERITY) + detections.severity).clamp(0, MAX_SEVERITY);
+        });
     }
 }
 
-pub trait KunaiEvent: ::gene::Event + ::gene::FieldGetter + IocGetter + Scannable {
-    fn set_detection(&mut self, sr: ScanResult);
-    fn get_detection(&self) -> &Option<ScanResult>;
+pub trait KunaiEvent<'e>:
+    ::gene::Event<'e> + ::gene::FieldGetter<'e> + IocGetter + Scannable
+{
+    fn set_detection(&mut self, d: Detection) -> &Detection;
+    fn get_detection(&self) -> &Option<Detection>;
+    fn set_filter(&mut self, f: Filter) -> &Filter;
+    fn get_filter(&self) -> &Option<Filter>;
     fn info(&self) -> &EventInfo;
 }
 
@@ -310,7 +404,9 @@ pub trait KunaiEvent: ::gene::Event + ::gene::FieldGetter + IocGetter + Scannabl
 pub struct UserEvent<T> {
     pub data: T,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub detection: Option<ScanResult>,
+    pub detection: Option<Detection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<Filter>,
     pub info: EventInfo,
 }
 
@@ -334,18 +430,30 @@ where
     }
 }
 
-impl<T> KunaiEvent for UserEvent<T>
+impl<'e, T> KunaiEvent<'e> for UserEvent<T>
 where
-    T: FieldGetter + IocGetter + Scannable,
+    T: FieldGetter<'e> + IocGetter + Scannable,
 {
     #[inline(always)]
-    fn set_detection(&mut self, sr: ScanResult) {
-        self.detection = Some(sr)
+    fn set_detection(&mut self, d: Detection) -> &Detection {
+        self.detection = Some(d);
+        self.detection.as_ref().unwrap()
     }
 
     #[inline(always)]
-    fn get_detection(&self) -> &Option<ScanResult> {
+    fn get_detection(&self) -> &Option<Detection> {
         &self.detection
+    }
+
+    #[inline(always)]
+    fn set_filter(&mut self, f: Filter) -> &Filter {
+        self.filter = Some(f);
+        self.filter.as_ref().unwrap()
+    }
+
+    #[inline(always)]
+    fn get_filter(&self) -> &Option<Filter> {
+        &self.filter
     }
 
     #[inline(always)]
@@ -359,6 +467,7 @@ impl<T> UserEvent<T> {
         Self {
             data,
             detection: None,
+            filter: None,
             info: info.into(),
         }
     }
@@ -367,6 +476,7 @@ impl<T> UserEvent<T> {
         Self {
             data,
             detection: None,
+            filter: None,
             info,
         }
     }
@@ -452,7 +562,7 @@ macro_rules! def_user_data {
                 impl $struct_name {
                     #[inline(always)]
                     fn _iocs(&self) -> Vec<Cow<'_,str>>{
-                        vec![self.exe.file.to_string_lossy()]
+                        vec![self.exe.path.to_string_lossy()]
                     }
                 }
             };
@@ -461,6 +571,7 @@ macro_rules! def_user_data {
 #[derive(Debug, Serialize, Deserialize, FieldGetter)]
 pub struct ExecveData {
     pub ancestors: String,
+    pub parent_command_line: String,
     pub parent_exe: String,
     pub command_line: String,
     pub exe: Hashes,
@@ -471,9 +582,9 @@ pub struct ExecveData {
 impl Scannable for ExecveData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        let mut v = vec![Cow::Borrowed(&self.exe.file)];
+        let mut v = vec![Cow::Borrowed(&self.exe.path)];
         if let Some(interp) = self.interpreter.as_ref() {
-            v.push(Cow::Borrowed(&interp.file));
+            v.push(Cow::Borrowed(&interp.path));
         }
         v
     }
@@ -506,7 +617,7 @@ def_user_data!(
 impl Scannable for CloneData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file)]
+        vec![Cow::Borrowed(&self.exe.path)]
     }
 }
 
@@ -532,7 +643,7 @@ impl_std_iocs!(PrctlData);
 impl Scannable for PrctlData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file)]
+        vec![Cow::Borrowed(&self.exe.path)]
     }
 }
 
@@ -553,11 +664,28 @@ def_user_data!(
 impl Scannable for KillData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file)]
+        vec![Cow::Borrowed(&self.exe.path)]
     }
 }
 
 impl_std_iocs!(KillData);
+
+def_user_data!(
+    pub struct PtraceData {
+        #[serde(with = "u32_hex")]
+        pub mode: u32,
+        pub target: TargetTask,
+    }
+);
+
+impl Scannable for PtraceData {
+    #[inline]
+    fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
+        vec![Cow::Borrowed(&self.exe.path)]
+    }
+}
+
+impl_std_iocs!(PtraceData);
 
 def_user_data!(
     pub struct MmapExecData {
@@ -569,15 +697,15 @@ impl Scannable for MmapExecData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
         vec![
-            Cow::Borrowed(&self.exe.file),
-            Cow::Borrowed(&self.mapped.file),
+            Cow::Borrowed(&self.exe.path),
+            Cow::Borrowed(&self.mapped.path),
         ]
     }
 }
 
 impl IocGetter for MmapExecData {
     fn iocs(&mut self) -> Vec<Cow<'_, str>> {
-        let mut v = vec![self.exe.file.to_string_lossy()];
+        let mut v = vec![self.exe.path.to_string_lossy()];
         v.extend(self.mapped.iocs());
         v
     }
@@ -595,7 +723,7 @@ def_user_data!(
 impl Scannable for MprotectData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file)]
+        vec![Cow::Borrowed(&self.exe.path)]
     }
 }
 
@@ -672,7 +800,7 @@ def_user_data!(
 impl Scannable for ConnectData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file)]
+        vec![Cow::Borrowed(&self.exe.path)]
     }
 }
 
@@ -688,62 +816,35 @@ def_user_data!(
         pub socket: SocketInfo,
         pub src: SockAddr,
         pub query: String,
-        pub response: String,
+        pub query_type: Cow<'static, str>,
+        pub response: Vec<String>,
         pub dns_server: NetworkInfo,
         pub community_id: String,
-        #[serde(skip)]
-        #[getter(skip)]
-        responses: Vec<String>,
     }
 );
 
 impl DnsQueryData {
-    const SEP: &'static str = ";";
-
     pub fn new() -> Self {
         Default::default()
-    }
-
-    #[inline]
-    pub fn with_responses(mut self, responses: Vec<String>) -> Self {
-        self.response = responses.join(Self::SEP);
-        self.responses = responses;
-        self
-    }
-
-    #[inline]
-    fn cache_responses(&mut self) {
-        if !self.response.is_empty() && self.responses.is_empty() {
-            self.responses = self.response.split(Self::SEP).map(|s| s.into()).collect();
-        }
-    }
-
-    #[inline]
-    pub fn responses(&mut self) -> &Vec<String> {
-        self.cache_responses();
-        &self.responses
     }
 }
 
 impl Scannable for DnsQueryData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file)]
+        vec![Cow::Borrowed(&self.exe.path)]
     }
 }
 
 impl IocGetter for DnsQueryData {
     fn iocs(&mut self) -> Vec<Cow<'_, str>> {
-        // we build up responses if needed
-        self.cache_responses();
-
         // set executable
-        let mut v = vec![self.exe.file.to_string_lossy()];
+        let mut v = vec![self.exe.path.to_string_lossy()];
         // the ip addresses in the response
         v.extend(
-            self.responses
+            self.response
                 .iter()
-                .map(|ioc| ioc.into())
+                .map(|ioc| Cow::Borrowed(ioc.as_str()))
                 .collect::<Vec<Cow<'_, str>>>(),
         );
         // the domain queried
@@ -768,13 +869,13 @@ def_user_data!(
 impl Scannable for SendDataData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file)]
+        vec![Cow::Borrowed(&self.exe.path)]
     }
 }
 
 impl IocGetter for SendDataData {
     fn iocs(&mut self) -> Vec<Cow<'_, str>> {
-        let mut v = vec![self.exe.file.to_string_lossy()];
+        let mut v = vec![self.exe.path.to_string_lossy()];
         v.extend(self.dst.iocs());
         v
     }
@@ -793,14 +894,14 @@ pub struct InitModuleData {
 
 impl IocGetter for InitModuleData {
     fn iocs(&mut self) -> Vec<Cow<'_, str>> {
-        vec![self.exe.file.to_string_lossy()]
+        vec![self.exe.path.to_string_lossy()]
     }
 }
 
 impl Scannable for InitModuleData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file)]
+        vec![Cow::Borrowed(&self.exe.path)]
     }
 }
 
@@ -812,14 +913,14 @@ def_user_data!(
 
 impl IocGetter for FileData {
     fn iocs(&mut self) -> Vec<Cow<'_, str>> {
-        vec![self.exe.file.to_string_lossy(), self.path.to_string_lossy()]
+        vec![self.exe.path.to_string_lossy(), self.path.to_string_lossy()]
     }
 }
 
 impl Scannable for FileData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file), Cow::Borrowed(&self.path)]
+        vec![Cow::Borrowed(&self.exe.path), Cow::Borrowed(&self.path)]
     }
 }
 
@@ -832,14 +933,14 @@ def_user_data!(
 
 impl IocGetter for UnlinkData {
     fn iocs(&mut self) -> Vec<Cow<'_, str>> {
-        vec![self.exe.file.to_string_lossy(), self.path.to_string_lossy()]
+        vec![self.exe.path.to_string_lossy(), self.path.to_string_lossy()]
     }
 }
 
 impl Scannable for UnlinkData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file)]
+        vec![Cow::Borrowed(&self.exe.path)]
     }
 }
 
@@ -853,7 +954,7 @@ def_user_data!(
 impl IocGetter for FileRenameData {
     fn iocs(&mut self) -> Vec<Cow<'_, str>> {
         vec![
-            self.exe.file.to_string_lossy(),
+            self.exe.path.to_string_lossy(),
             self.old.to_string_lossy(),
             self.new.to_string_lossy(),
         ]
@@ -863,7 +964,7 @@ impl IocGetter for FileRenameData {
 impl Scannable for FileRenameData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file), Cow::Borrowed(&self.new)]
+        vec![Cow::Borrowed(&self.exe.path), Cow::Borrowed(&self.new)]
     }
 }
 
@@ -899,7 +1000,7 @@ def_user_data!(
 impl IocGetter for BpfProgLoadData {
     fn iocs(&mut self) -> Vec<Cow<'_, str>> {
         vec![
-            self.exe.file.to_string_lossy(),
+            self.exe.path.to_string_lossy(),
             self.bpf_prog.md5.as_str().into(),
             self.bpf_prog.sha1.as_str().into(),
             self.bpf_prog.sha256.as_str().into(),
@@ -911,7 +1012,7 @@ impl IocGetter for BpfProgLoadData {
 impl Scannable for BpfProgLoadData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file)]
+        vec![Cow::Borrowed(&self.exe.path)]
     }
 }
 
@@ -954,14 +1055,14 @@ def_user_data!(
 impl Scannable for BpfSocketFilterData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file)]
+        vec![Cow::Borrowed(&self.exe.path)]
     }
 }
 
 impl IocGetter for BpfSocketFilterData {
     fn iocs(&mut self) -> Vec<Cow<'_, str>> {
         vec![
-            self.exe.file.to_string_lossy(),
+            self.exe.path.to_string_lossy(),
             self.filter.md5.as_str().into(),
             self.filter.sha1.as_str().into(),
             self.filter.sha256.as_str().into(),
@@ -979,29 +1080,66 @@ def_user_data!(
 impl Scannable for ExitData {
     #[inline]
     fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
-        vec![Cow::Borrowed(&self.exe.file)]
+        vec![Cow::Borrowed(&self.exe.path)]
     }
 }
 
 impl_std_iocs!(ExitData);
 
+#[derive(Debug, Default, FieldGetter, Serialize, Deserialize)]
+pub struct IoUringOp {
+    pub code: u8,
+    pub name: String,
+}
+
+def_user_data!(
+    pub struct IoUringSqeData {
+        pub op: IoUringOp,
+    }
+);
+
+impl Scannable for IoUringSqeData {
+    #[inline]
+    fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
+        vec![Cow::Borrowed(&self.exe.path)]
+    }
+}
+
+impl_std_iocs!(IoUringSqeData);
+
+def_user_data!(
+    pub struct ErrorData {
+        pub code: u64,
+        pub message: String,
+    }
+);
+
+impl Scannable for ErrorData {
+    #[inline]
+    fn scannable_files(&self) -> Vec<Cow<'_, PathBuf>> {
+        vec![Cow::Borrowed(&self.exe.path)]
+    }
+}
+
+impl_std_iocs!(ErrorData);
+
 #[derive(Default, Debug, Serialize, Deserialize, FieldGetter)]
 pub struct FileScanData {
-    pub file: PathBuf,
+    pub path: PathBuf,
     pub meta: FileMeta,
     #[getter(skip)]
     pub signatures: Vec<String>,
     pub positives: usize,
     pub source_event: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_error: Option<String>,
 }
 
 impl FileScanData {
     pub fn from_hashes(h: Hashes) -> Self {
+        let p = h.path.clone();
         Self {
-            file: h.file,
-            meta: h.meta,
+            path: p,
+            meta: h.into(),
             ..Default::default()
         }
     }
@@ -1018,8 +1156,25 @@ impl IocGetter for FileScanData {
     // we might want to scan hashes against IoCs later than execve
     #[inline(always)]
     fn iocs(&mut self) -> Vec<Cow<'_, str>> {
-        let mut v = vec![self.file.to_string_lossy()];
+        let mut v = vec![self.path.to_string_lossy()];
         v.extend(self.meta.iocs());
         v
+    }
+}
+
+#[derive(Default, Debug, Serialize, Deserialize, FieldGetter)]
+pub struct LossData {
+    pub read: u64,
+    pub lost: u64,
+    pub eps: f64,
+}
+
+impl From<&bpf_events::LossData> for LossData {
+    fn from(value: &bpf_events::LossData) -> Self {
+        Self {
+            read: value.read,
+            lost: value.lost,
+            eps: value.eps,
+        }
     }
 }

@@ -91,6 +91,15 @@ Using anonymous structs seems to make the linking fail
 		return bpf_core_enum_value_exists(enum enum_type, enum_value);              \
 	}
 
+// Exposes the CO-RE-resolved size of a struct as shim_size_of_<struct>().
+// The returned value reflects the actual kernel struct size at runtime, not
+// the (potentially incomplete) definition in this file.
+#define SHIM_SIZE_OF(struc)                                          \
+	__attribute__((always_inline)) __u64 shim_size_of_##struc()      \
+	{                                                                \
+		return bpf_core_type_size(struct struc);                     \
+	}
+
 struct kgid_t
 {
 	gid_t val;
@@ -115,13 +124,23 @@ _SHIM_GETTER_BPF_CORE_READ(gid_t, shim_cred_gid(struct cred *pcred), pcred, gid.
 
 struct qstr
 {
-	__u64 hash_len;
+	union {
+		__u64 hash_len;
+		struct
+		{
+			u32 hash;
+			u32 len;
+		};
+	};
+
 	const unsigned char *name;
 }
 __attribute__((preserve_access_index));
 
 SHIM(qstr, name);
 SHIM(qstr, hash_len);
+SHIM(qstr, hash);
+SHIM(qstr, len);
 
 struct vfsmount
 {
@@ -209,18 +228,24 @@ struct inode
 	unsigned long i_ino;
 	struct super_block *i_sb;
 	loff_t i_size;
-	union
-	{
+	// mac time changed in kernel 6.11
+	// https://elixir.bootlin.com/linux/v6.11/source/include/linux/fs.h#L668
+	time64_t i_atime_sec;
+	time64_t i_mtime_sec;
+	time64_t i_ctime_sec;
+	u32 i_atime_nsec;
+	u32 i_mtime_nsec;
+	u32 i_ctime_nsec;
+	// use these kernels < 6.11
+	union {
 		struct timespec64 i_atime;
 		struct timespec64 __i_atime;
 	};
-	union
-	{
+	union {
 		struct timespec64 i_mtime;
 		struct timespec64 __i_mtime;
 	};
-	union
-	{
+	union {
 		struct timespec64 i_ctime;
 		struct timespec64 __i_ctime;
 	};
@@ -232,21 +257,31 @@ SHIM(inode, i_sb);
 SHIM(inode, i_size);
 SHIM(inode, i_atime);
 SHIM(inode, __i_atime);
+SHIM(inode, i_atime_sec);
+SHIM(inode, i_atime_nsec);
 SHIM(inode, i_mtime);
 SHIM(inode, __i_mtime);
+SHIM(inode, i_mtime_sec);
+SHIM(inode, i_mtime_nsec);
 SHIM(inode, i_ctime);
 SHIM(inode, __i_ctime);
+SHIM(inode, i_ctime_sec);
+SHIM(inode, i_ctime_nsec);
 
 struct file
 {
 	struct inode *f_inode;
 	struct path f_path;
 	void *private_data;
+	unsigned int f_flags;
+	unsigned int f_mode;
 } __attribute__((preserve_access_index));
 
 SHIM_REF(file, f_path);
 SHIM(file, f_inode);
 SHIM(file, private_data);
+SHIM(file, f_flags);
+SHIM(file, f_mode);
 
 struct fd
 {
@@ -382,8 +417,7 @@ struct task_struct
 	pid_t pid;
 	__u64 start_time;
 	// attempt to make compatible with older kernels
-	union
-	{
+	union {
 		__u64 start_boottime;
 		__u64 real_start_time;
 	};
@@ -523,8 +557,7 @@ typedef __u32 __portpair;
 
 struct in6_addr
 {
-	union
-	{
+	union {
 		__u8 u6_addr8[16];
 		__be16 u6_addr16[8];
 		__be32 u6_addr32[4];
@@ -575,13 +608,11 @@ SHIM_REF(sockaddr_in6, sin6_addr);
 
 struct sock_common
 {
-	union
-	{
+	union {
 		__addrpair skc_addrpair;
 	};
 
-	union
-	{
+	union {
 		__portpair skc_portpair;
 	};
 
@@ -697,6 +728,8 @@ struct page
 	long unsigned int flags;
 } __attribute__((preserve_access_index));
 
+SHIM_SIZE_OF(page);
+
 struct bio_vec
 {
 	struct page *bv_page;
@@ -710,22 +743,19 @@ SHIM(bio_vec, bv_offset);
 
 struct iov_iter
 {
-	union
-	{
+	union {
 		u8 iter_type;
 		unsigned int type;
 	};
 	size_t count;
-	union
-	{
+	union {
 		struct iovec *iov;
 		struct iovec *__iov;
 		void *ubuf;
 		struct bio_vec *bvec;
 	};
 
-	union
-	{
+	union {
 		unsigned long nr_segs;
 	};
 } __attribute__((preserve_access_index));
@@ -769,3 +799,25 @@ struct kernel_clone_args
 } __attribute__((preserve_access_index));
 
 SHIM(kernel_clone_args, flags);
+
+// available only in [ 5.1 ; 5.4 ]
+struct sqe_submit
+{
+	const struct io_uring_sqe *sqe;
+} __attribute__((preserve_access_index));
+
+SHIM(sqe_submit, sqe);
+
+struct io_uring_sqe
+{
+	__u8 opcode; /* type of operation for this sqe */
+} __attribute__((preserve_access_index));
+
+SHIM(io_uring_sqe, opcode);
+
+struct io_kiocb
+{
+	u8 opcode;
+} __attribute__((preserve_access_index));
+
+SHIM(io_kiocb, opcode);

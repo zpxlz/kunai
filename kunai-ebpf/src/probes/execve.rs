@@ -1,20 +1,30 @@
 use super::*;
 
+use aya_ebpf::cty::c_int;
 use aya_ebpf::maps::LruHashMap;
-use aya_ebpf::programs::{ProbeContext, TracePointContext};
+use aya_ebpf::programs::{ProbeContext, RetProbeContext, TracePointContext};
 use aya_ebpf::EbpfContext;
 use co_re::task_struct;
 use kunai_common::syscalls::SysExitArgs;
 
+const MAP_SIZE: u32 = 2048;
+
 #[map]
-static mut EXECVE_TRACKING: LruHashMap<u128, ExecveEvent> = LruHashMap::with_max_entries(4096, 0);
+static mut EXECVE_TRACKING: LruHashMap<u128, ExecveEvent> =
+    LruHashMap::with_max_entries(MAP_SIZE, 0);
 
-// this guy gives us the real executable path (i.e. a script for instance)
-// we need to hook at another point in order to get the interpreter. For
-// instance at exit of bprm_execve.
-
+/// this guy gives us the real executable path (i.e. a script for instance)
+/// we need to hook at another point in order to get the interpreter. For
+/// instance at exit of bprm_execve.
+///
+/// match-proto:v5.0:security/security.c:int security_bprm_check(struct linux_binprm *bprm)
+/// match-proto:latest:security/security.c:int security_bprm_check(struct linux_binprm *bprm)
 #[kprobe(function = "security_bprm_check")]
 pub fn execve_security_bprm_check(ctx: ProbeContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     match unsafe { try_security_bprm_check(&ctx) } {
         Ok(_) => errors::BPF_PROG_SUCCESS,
         Err(s) => {
@@ -26,8 +36,8 @@ pub fn execve_security_bprm_check(ctx: ProbeContext) -> u32 {
 
 unsafe fn try_security_bprm_check(ctx: &ProbeContext) -> ProbeResult<()> {
     let linux_binprm = co_re::linux_binprm::from_ptr(ctx.arg(0).unwrap_or(core::ptr::null()));
-    let ts = co_re::task_struct::current();
-    let task_uuid = ts.uuid();
+    let current = co_re::task_struct::current();
+    let task_uuid = current.uuid();
 
     if EXECVE_TRACKING.get_ptr_mut(&task_uuid).is_some() {
         // security_bprm_check is running in a loop
@@ -50,6 +60,13 @@ unsafe fn try_security_bprm_check(ctx: &ProbeContext) -> ProbeResult<()> {
             .core_resolve_file(&file, MAX_PATH_DEPTH)?;
     }
 
+    // read uts nodename and store it in event
+    // it was put here to offload a bit from execve_event
+    event.data.nodename.read_kernel_at(
+        core_read_kernel!(current, nsproxy, uts_ns, name, nodename)?,
+        event.data.nodename.cap() as u32,
+    )?;
+
     EXECVE_TRACKING
         .insert(&task_uuid, event, 0)
         .map_err(|_| MapError::InsertFailure)?;
@@ -59,13 +76,20 @@ unsafe fn try_security_bprm_check(ctx: &ProbeContext) -> ProbeResult<()> {
 
 #[map]
 static mut BPRM_EXECVE_ARGS: LruHashMap<u64, co_re::linux_binprm> =
-    LruHashMap::with_max_entries(1024, 0);
+    LruHashMap::with_max_entries(MAP_SIZE, 0);
 
-// for kernel < 5.9 bprm_execve does not exists, we must replace the hook
-// by __do_execve_file (done in program loader)
-
+/// for kernel < 5.9 bprm_execve does not exists, we must replace the hook
+/// by __do_execve_file (done in program loader)
+///
+/// match-proto:v5.9:fs/exec.c:static int bprm_execve(struct linux_binprm *bprm, int fd, struct filename *filename, int flags)
+/// match-proto:v6.8:fs/exec.c:static int bprm_execve(struct linux_binprm *bprm)
+/// match-proto:latest:fs/exec.c:static int bprm_execve(struct linux_binprm *bprm)
 #[kretprobe(function = "bprm_execve")]
-pub fn execve_exit_bprm_execve(ctx: ProbeContext) -> u32 {
+pub fn execve_exit_bprm_execve(ctx: RetProbeContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     match unsafe { try_bprm_execve(&ctx) } {
         Ok(_) => errors::BPF_PROG_SUCCESS,
         Err(s) => {
@@ -81,23 +105,15 @@ unsafe fn execve_event<C: EbpfContext>(ctx: &C, rc: i32) -> ProbeResult<()> {
         .get(&bpf_task_tracking_id())
         .ok_or(MapError::GetFailure)?;
 
-    let ts = task_struct::current();
+    let current = task_struct::current();
 
-    let task_uuid = ts.uuid();
+    let task_uuid = current.uuid();
 
     let event = EXECVE_TRACKING
         .get_ptr_mut(&task_uuid)
         .ok_or(MapError::GetFailure)?;
 
     let event = &mut (*event);
-
-    let current = task_struct::current();
-
-    // getting nodename first as we need the current task struct
-    event.data.nodename.read_kernel_at(
-        core_read_kernel!(current, nsproxy, uts_ns, name, nodename)?,
-        event.data.nodename.cap() as u32,
-    )?;
 
     // initializing event
     event.init_from_task(Type::Execve, current)?;
@@ -113,8 +129,8 @@ unsafe fn execve_event<C: EbpfContext>(ctx: &C, rc: i32) -> ProbeResult<()> {
 
     event.data.rc = rc;
 
-    let arg_start = core_read_kernel!(ts, mm, arg_start)?;
-    let arg_len = core_read_kernel!(ts, mm, arg_len)?;
+    let arg_start = core_read_kernel!(current, mm, arg_start)?;
+    let arg_len = core_read_kernel!(current, mm, arg_len)?;
 
     // parsing argv
     if event
@@ -123,24 +139,25 @@ unsafe fn execve_event<C: EbpfContext>(ctx: &C, rc: i32) -> ProbeResult<()> {
         .read_user_at(arg_start as *const u8, arg_len as u32)
         .is_err()
     {
-        warn_msg!(ctx, "failed to read argv")
+        warn!(ctx, "failed to read argv")
     }
 
     // cgroup parsing
-    let cgroup = core_read_kernel!(ts, sched_task_group, css, cgroup)?;
+    let cgroup = core_read_kernel!(current, sched_task_group, css, cgroup)?;
     // we do not raise any error on cgroup parsing, we let a chance to userland to solve it
     ignore_result!(event.data.cgroup.resolve(cgroup));
 
     pipe_event(ctx, event);
 
-    // we use a LruHashMap so we can safely ignore result
+    // we use LruHashMap so we can safely ignore results
     ignore_result!(EXECVE_TRACKING.remove(&task_uuid));
+    ignore_result!(BPRM_EXECVE_ARGS.remove(&bpf_task_tracking_id()));
 
     Ok(())
 }
 
-unsafe fn try_bprm_execve(ctx: &ProbeContext) -> ProbeResult<()> {
-    let rc = ctx.ret().unwrap_or(-1);
+unsafe fn try_bprm_execve(ctx: &RetProbeContext) -> ProbeResult<()> {
+    let rc: c_int = ctx.ret();
 
     // execve failed
     if rc < 0 {
@@ -152,6 +169,10 @@ unsafe fn try_bprm_execve(ctx: &ProbeContext) -> ProbeResult<()> {
 
 #[tracepoint(name = "sys_exit_execve", category = "syscalls")]
 pub fn syscalls_sys_exit_execve(ctx: TracePointContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     match unsafe { try_sys_exit_execve(&ctx) } {
         Ok(_) => errors::BPF_PROG_SUCCESS,
         Err(s) => {
@@ -163,6 +184,10 @@ pub fn syscalls_sys_exit_execve(ctx: TracePointContext) -> u32 {
 
 #[tracepoint(name = "sys_exit_execveat", category = "syscalls")]
 pub fn syscalls_sys_exit_execveat(ctx: TracePointContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     match unsafe { try_sys_exit_execve(&ctx) } {
         Ok(_) => errors::BPF_PROG_SUCCESS,
         Err(s) => {

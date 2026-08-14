@@ -1,7 +1,8 @@
-use aya_ebpf::{macros::map, maps::LruPerCpuHashMap, EbpfContext};
+use aya_ebpf::{macros::map, maps::LruPerCpuHashMap};
 
 use crate::{
-    bpf_events::{error, ErrorEvent},
+    bpf_events::{log, LogEvent},
+    option::BpfOption,
     string::String,
 };
 
@@ -9,179 +10,143 @@ use crate::{
 use super::*;
 
 #[map]
-pub static mut ERRORS: LruPerCpuHashMap<u32, ErrorEvent> =
-    LruPerCpuHashMap::with_max_entries(16, 0);
+pub static mut LOGS: LruPerCpuHashMap<u32, LogEvent> = LruPerCpuHashMap::with_max_entries(16, 0);
 
-const SIZE: usize = ErrorEvent::size_of();
-pub static EMPTY_ERROR: [u8; SIZE] = [0; SIZE];
+const SIZE: usize = LogEvent::size_of();
+pub static EMPTY_LOG: [u8; SIZE] = [0; SIZE];
 
 #[macro_export]
 macro_rules! probe_name {
     () => {{
-        const fn index(skip: &'static str, st: &'static str) -> usize {
-            let mut i = 0;
-            let skip = skip.as_bytes();
-            let st = st.as_bytes();
+        const fn string_loc<const N: usize>(st: &'static str) -> $crate::string::String<N> {
+            let src = "src/";
+            let mut s = $crate::string::String::new();
+            let mut it = $crate::string::CharsIterator::from_str(st);
+            let i_src = match it.chars_until_last(src) {
+                Some(n) => n,
+                None => 0,
+            };
+            it.reset();
+            // this works because src is ascii
+            it.skip(i_src + src.len());
 
-            // we cannot skip something larger than string
-            if skip.len() > st.len() {
-                return i;
-            }
-
-            loop {
-                if i == skip.len() || i == st.len() || skip[i] != st[i] {
-                    break;
-                }
-
-                i += 1
-            }
-
-            i
-        }
-
-        const fn string_loc<const N: usize>(st: &'static str) -> kunai_common::string::String<N> {
-            let mut s = kunai_common::string::String { s: [0; N], len: 0 };
-            let mut i = 0;
-            let i_src = index("src/", st);
-            let ext = ".rs";
-            let bytes = st.as_bytes();
-
-            loop {
-                let i_bytes = i_src + i;
-
-                // we leave a 0 to terminate the string if string
-                // larger than capacity
-                if i == s.cap() - 1 || i_bytes >= (st.len() - ext.len()) {
-                    break;
-                }
-
-                if bytes[i_bytes] == b'/' {
-                    let mut k = 0;
-                    loop {
-                        if k == 2 {
-                            break;
-                        }
-                        if s.len < N {
-                            s.s[s.len] = b':';
-                            s.len += 1;
-                        }
-                        k += 1;
+            while let Some(c) = it.next_char() {
+                match c {
+                    '.' => break,
+                    '/' => {
+                        let _ = s.push_char(':');
+                        let _ = s.push_char(':');
+                        continue;
                     }
-                } else {
-                    s.s[s.len] = bytes[i_src + i];
+                    _ => {
+                        let _ = s.push_char(c);
+                    }
                 }
-
-                s.len += 1;
-                i += 1
             }
+
             s
         }
+
         string_loc(file!())
     }};
 }
 
+#[repr(C)]
 pub struct Args {
     pub line: u32,
     pub location: String<32>,
-    pub message: Option<String<64>>,
-    pub err: Option<ProbeError>,
-    pub level: error::Level,
-}
-
-#[inline(always)]
-pub unsafe fn error_with_args<C: EbpfContext>(ctx: &C, args: &Args) {
-    let _ = ERRORS.insert(&0, &(*(EMPTY_ERROR.as_ptr() as *const ErrorEvent)), 0);
-    if let Some(e) = ERRORS.get_ptr_mut(&0) {
-        let e = &mut *e;
-        e.init_with_level(args.level);
-        e.info.etype = bpf_events::Type::Error;
-        e.data.location.copy_from(&args.location);
-        e.data.line = args.line;
-        e.data.error = args.err;
-        e.data.message = args.message;
-
-        bpf_events::pipe_error(ctx, e);
-    }
+    pub message: BpfOption<String<64>>,
+    pub err: BpfOption<ProbeError>,
+    pub level: log::Level,
 }
 
 #[macro_export]
-macro_rules! _error {
+macro_rules! log {
     ($ctx:expr, $msg:literal, $err:expr, $level:expr) => {{
         unsafe {
-            const _PROBE_NAME: kunai_common::string::String<32> = $crate::probe_name!();
-            const _MSG: kunai_common::string::String<64> = kunai_common::string::from_static($msg);
+            const _PROBE_NAME: $crate::string::String<32> = $crate::probe_name!();
+            const _MSG: $crate::string::String<64> = $crate::string::from_str_fitting($msg);
 
-            let args = kunai_common::errors::Args {
-                line: core::line!(),
-                location: _PROBE_NAME,
-                message: {
+            let _ = LOGS.insert(&0, &(*(EMPTY_LOG.as_ptr() as *const LogEvent)), 0);
+            if let Some(e) = LOGS.get_ptr_mut(&0) {
+                let e = &mut *e;
+                e.init_with_level($level);
+                e.info.etype = $crate::bpf_events::Type::Log;
+                e.data.location.clone_from(&_PROBE_NAME);
+                e.data.line = core::line!();
+                e.data.error = $err;
+                e.data.message = {
                     if !$msg.is_empty() {
-                        Some(_MSG)
+                        $crate::option::BpfOption::Some(_MSG)
                     } else {
-                        None
+                        $crate::option::BpfOption::None
                     }
-                },
-                err: $err,
-                level: $level,
-            };
+                };
 
-            kunai_common::errors::error_with_args($ctx, &args);
+                $crate::bpf_events::pipe_log($ctx, e);
+            }
         };
     }};
 }
 
 #[macro_export]
 macro_rules! error {
-    ($ctx:expr, $err:expr) => {{
-        $crate::error!($ctx, "", $err)
-    }};
-
-    ($ctx:expr, $msg:literal, $err:expr) => {{
-        $crate::_error!(
-            $ctx,
-            $msg,
-            Some($err),
-            kunai_common::bpf_events::error::Level::Error
-        );
-    }};
-}
-
-#[macro_export]
-macro_rules! error_msg {
+    // literal must be evaluated first
     ($ctx:expr, $msg:literal) => {
-        $crate::_error!(
+        $crate::log!(
             $ctx,
             $msg,
-            None,
-            kunai_common::bpf_events::error::Level::Error
+            $crate::option::BpfOption::None,
+            $crate::bpf_events::log::Level::Error
         )
+    };
+
+    ($ctx:expr, $err:expr) => {
+        $crate::log!(
+            $ctx,
+            "",
+            $crate::option::BpfOption::Some($err),
+            $crate::bpf_events::log::Level::Error
+        )
+    };
+
+    ($ctx:expr, $msg:literal, $err:expr) => {
+        $crate::log!(
+            $ctx,
+            $msg,
+            $crate::option::BpfOption::Some($err),
+            $crate::bpf_events::log::Level::Error
+        );
     };
 }
 
 #[macro_export]
 macro_rules! warn {
+    // literal must be evaluated first
+    ($ctx:expr, $msg:literal) => {
+        $crate::log!(
+            $ctx,
+            $msg,
+            $crate::option::BpfOption::None,
+            $crate::bpf_events::log::Level::Warn
+        )
+    };
+
     ($ctx:expr, $err:expr) => {
-        $crate::warn!($ctx, "", $err);
+        $crate::log!(
+            $ctx,
+            "",
+            $crate::option::BpfOption::Some($err),
+            $crate::bpf_events::log::Level::Warn
+        );
     };
 
     ($ctx:expr, $msg:literal, $err:expr) => {
-        $crate::_error!(
+        $crate::log!(
             $ctx,
             $msg,
-            Some($err),
-            kunai_common::bpf_events::error::Level::Warn
+            $crate::option::BpfOption::Some($err),
+            $crate::bpf_events::log::Level::Warn
         );
-    };
-}
-
-#[macro_export]
-macro_rules! warn_msg {
-    ($ctx:expr, $msg:literal) => {
-        $crate::_error!(
-            $ctx,
-            $msg,
-            None,
-            kunai_common::bpf_events::error::Level::Warn
-        )
     };
 }

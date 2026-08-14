@@ -7,39 +7,46 @@
 [![GitHub release (with filter)](https://img.shields.io/github/v/release/0xrawsec/kunai?style=for-the-badge&label=stable&color=green)](https://github.com/0xrawsec/kunai/releases/latest)
 [![Documentation](https://img.shields.io/badge/docs-stable-blue.svg?style=for-the-badge&logo=docsdotrs)](https://why.kunai.rocks)
 
+<!--
 [![GitHub Latest Release](https://img.shields.io/github/v/release/kunai-project/kunai?include_prereleases&style=for-the-badge&label=unstable
 )](https://github.com/kunai-project/kunai/releases)
 [![Documentation](https://img.shields.io/badge/docs-unstable-orange.svg?style=for-the-badge&logo=docsdotrs)](https://why.kunai.rocks/docs/next/quickstart)
+-->
 
 # Leitmotiv
 
-The goal behind this project is to bring relevant events to achieve 
-various monitoring tasks ranging from security monitoring to Threat Hunting on 
-Linux based systems. If you are familiar with Sysmon on Windows, you can think of Kunai as being a Sysmon equivalent for Linux.
+Kunai is a powerful tool designed to bring actionable insights for tasks such as **security monitoring** and **threat hunting** on **Linux** systems. Think of it as the Linux counterpart to Sysmon on Windows, tailored for comprehensive and precise event monitoring.
 
-## What makes Kunai special ?
+## Why Kunai Stands Out
 
-* events arrive sorted in chronological order
-* benefits from on-host correlation and events enrichment
-* works well with Linux namespaces and container technologies (you can trace all the activity happening inside your containers)
+- **Chronologically Ordered Events:** Events are processed and delivered in the exact order they occur.
+- **On-Host Correlation:** Built-in capabilities for event enrichment and correlation to provide deeper context.
+- **Container-Aware:** Fully compatible with Linux namespaces and container technologies, enabling complete tracing of container activities.
 
-# How it works
+## How It Works
 
-All the kernel components of this project are running as eBPF programs (also called probes). Kunai embeds numbers of probes to monitor relevant information for security monitoring. When the job is done on eBPF side, information is passed on to a userland program which is responsible for various things, such as re-ordering, enriching and correlating events.
+Kunai leverages eBPF (Extended Berkeley Packet Filter) technology, with kernel-level probes that capture critical events. These probes send data to a userland program, responsible for tasks like reordering, enriching, and correlating the collected events.
 
-On the implementation side, Kunai is written for its majority in Rust, leveraging the **awesome** [Aya library](https://github.com/aya-rs/aya) so everything you'll need to run is a standalone binary embedding both all the eBPF probes and the userland program.
+On the implementation side, Kunai is predominantly written in Rust, using the robust [Aya library](https://github.com/aya-rs/aya). This design ensures a self-contained standalone binary, embedding both the eBPF probes and the userland processing logic for ease of deployment.
 
 # FAQ
 
 * **Is it compatible with my OS/Kernel ?** : Check out [the compatibility page](https://why.kunai.rocks/docs/compatibility)
-* **What kind of events can I get ?** : Please take a read to [events documentation](https://why.kunai.rocks/docs/category/kunai---events)
+* **What kind of events can I get ?** : Please take a read to [events documentation](https://why.kunai.rocks/docs/events/)
 * **Which version should I use ?**: If it is just to test the tool, use the latest build as it is always the best in terms of features and bug fix. However keep in mind that events in **non stable** releases **are subject to change**.
 
-# How to build the project ?
+# How to Build the Project?
 
-Before going further, I have to remind you that there is a distribution agnostic (built with **musl**) pre-compiled version of kunai available [in release page](https://github.com/0xrawsec/kunai/releases/latest). So if you just want to give a try to kunai, you probably don't need to build the project yourself.
+Before proceeding, please note that a distribution-agnostic, pre-compiled version of Kunai is available on the [release page](https://github.com/kunai-project/kunai/releases/latest). If you simply want to try Kunai, you likely don’t need to build the project yourself.
 
-## Requirements
+## With a Docker image
+
+You can use a Docker image that includes everything needed to build the project easily: [Kunai build docker image](https://github.com/kunai-project/kunai-build-docker/).  
+This one-size-fits-all solution should work on any Linux distribution.
+
+## Doing everything by hand
+
+### Requirements
 
 Before being able to build everything, you need to install a couple of tools.
 
@@ -50,47 +57,64 @@ Example of commands to install requirements on Ubuntu/Debian:
 
 ```bash
 sudo apt update
-sudo apt install -y clang libbpf-dev
+sudo apt install -y clang libbpf-dev lld musl-tools
 
 # assuming you have rustup and cargo installed
 cargo install bpf-linker
 ```
 
-## Building Kunai
+### Building Kunai
 
-Once you have the **requirements** installed, you are good to go. You can now build the project with **xtask**, a cargo command (specific to this project) to make your life easier.
+Once you have the **requirements** installed, you are good to go.
 
-Building debug version
+#### Building debug version
 ```bash
-cargo xtask build
-# find your executable in: ./target/x86_64-unknown-linux-musl/debug/kunai
+cargo build
+# find your executable in: ./target/debug/kunai
 ```
 
-Building release version (harder, better, faster, stronger)
+#### Building for production. 
+
+For production deployment, we recommend building a static binary using MUSL:
+
 ```bash
-cargo xtask build --release
-# find your executable in: ./target/x86_64-unknown-linux-musl/release/kunai
+# Build static release binary
+cargo build --release --target x86_64-unknown-linux-musl
+
+# The static binary will be available at:
+./target/x86_64-unknown-linux-musl/release/kunai
 ```
+
+**Why MUSL?** MUSL produces static binaries that are more portable across different Linux distributions, avoiding dependency issues with glibc versions. This is particularly important for production deployment where you may not control the target environment.
 
 ### Cross-compiling
 
 #### aarch64
 
-1. Install the proper target using rustup `rustup install target aarch64-unknown-linux-gnu`
-2. You need to install appropriate compiler and linker to cross-compile
-```bash
-# example on ubuntu
-sudo apt install gcc-aarch64-linux-gnu
-```
-4. Cross-compile the project
-```bash
-# compile the project for with release profile
-CC=aarch64-linux-gnu-gcc  cargo xbuild --release --target aarch64-unknown-linux-gnu --linker aarch64-linux-gnu-gcc
-```
-4. You should find your cross-compiled binary at `./target/aarch64-unknown-linux-gnu/release/kunai`
+To cross-compile kunai for aarch64:
 
-**NB:** specifying `--linker` option is just a shortcut for setting appropriate RUSTFLAGS env variable when building userland
-application.
+1. Install the aarch64 musl target:
+   ```bash
+   rustup target add aarch64-unknown-linux-musl
+   ```
+
+2. Install the cross-compilation toolchain (Ubuntu/Debian example):
+   ```bash
+   sudo dpkg --add-architecture arm64
+   sudo apt update
+   sudo apt install -y git clang libbpf-dev lld musl-tools
+   sudo apt install -y crossbuild-essential-arm64 musl-tools:arm64
+   ```
+
+3. Build for aarch64:
+   ```bash
+   cargo build --release --target aarch64-unknown-linux-musl
+   ```
+
+4. The cross-compiled binary will be available at:
+   ```
+   ./target/aarch64-unknown-linux-musl/release/kunai
+   ```
 
 # Memory Profiling
 
@@ -98,7 +122,7 @@ If one believes Kunai has an issue with memory, here is a way to profile it.
 
 ```bash
 # compile kunai with debug information for all packages
-RUSTFLAGS="-g" cargo xbuild
+RUSTFLAGS="-g" cargo build
 
 # use heaptrack
 sudo heaptrack kunai

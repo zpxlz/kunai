@@ -1,16 +1,13 @@
 #![deny(unused_imports)]
 
-use std::collections::HashSet;
-
-use aya::{
-    include_bytes_aligned, programs::ProgramError, util::kernel_symbols, Bpf, BpfLoader, Btf,
-    VerifierLogLevel,
-};
+use aya::{include_bytes_aligned, programs::ProgramError, Btf, Ebpf, EbpfLoader, VerifierLogLevel};
 use compat::Programs;
 use config::Config;
 use kunai_common::{config::BpfConfig, kernel, version::KernelVersion};
-use log::{info, warn};
+use log::{debug, error, info, warn};
 use util::{page_shift, page_size};
+
+use crate::kallsyms::KernelSymbols;
 
 pub mod cache;
 pub mod compat;
@@ -19,31 +16,28 @@ pub mod containers;
 pub mod events;
 pub mod info;
 pub mod ioc;
+pub mod kallsyms;
 pub mod util;
 pub mod yara;
 
 /// Holds the binary data of all the eBPF programs
 const BPF_ELF: &[u8] = {
-    #[cfg(debug_assertions)]
-    let d = include_bytes_aligned!("../../target/bpfel-unknown-none/debug/kunai-ebpf");
-    #[cfg(not(debug_assertions))]
-    let d = include_bytes_aligned!("../../target/bpfel-unknown-none/release/kunai-ebpf");
+    let d = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/kunai-ebpf"));
     d
 };
 
-/// function that responsible of probe priorities and compatibily across kernels
+/// Function managing probe priorities and compatibilities with kernels
 ///
 /// # Panic
 ///
 /// If a given probe name is not found
 #[allow(unused_variables)]
-fn configure_probes(conf: &Config, programs: &mut Programs, target: KernelVersion) {
-    // we need to be able to parse available symbols to check if some function exist
-    let sym = kernel_symbols()
-        .unwrap_or_default()
-        .into_values()
-        .collect::<HashSet<String>>();
-
+fn configure_probes(
+    conf: &Config,
+    symbols: &KernelSymbols,
+    programs: &mut Programs,
+    target: KernelVersion,
+) {
     // LSM probes are available only since 5.7
     // We disable them if we're not running in harden mode
     programs
@@ -84,15 +78,33 @@ fn configure_probes(conf: &Config, programs: &mut Programs, target: KernelVersio
     // mmap probe
     programs.expect_mut("syscalls_sys_enter_mmap").prio(90);
 
+    // io_uring probes
+    programs
+        .expect_mut("enter_io_submit_sqe")
+        .min_kernel(kernel!(5, 1))
+        .max_kernel(kernel!(5, 4));
+
+    programs
+        .expect_mut("io_uring_enter_io_issue_sqe")
+        .min_kernel(kernel!(5, 5));
+
+    // we need to hook another function to have all SQEs since v6.15: https://elixir.bootlin.com/linux/v6.15/source/io_uring/io_uring.c#L1779
+    programs
+        .expect_mut("io_uring_enter_io_poll_issue")
+        .min_kernel(kernel!(6, 15));
+
     // syscore_resume may be missing if kernel is compiled without CONFIG_PM_SLEEP
     // see: https://github.com/kunai-project/kunai/issues/105
-    if !sym.contains("syscore_resume") {
+    if !symbols.contains_text_symbol("syscore_resume") {
         programs.expect_mut("enter_syscore_resume").disable();
         // the risk is we disable a probe that changed name (not desired)
         // we know that until v6.12 the function is there so print warning
         // only if kernel is more recent.
         if target > kernel!(6, 12) {
-            warn!("syscore_resume probe has been disabled: make sure your kernel has been built without CONFIG_PM_SLEEP")
+            warn!(
+                "syscore_resume probe has been disabled: make sure your kernel has been built \
+                 without CONFIG_PM_SLEEP"
+            )
         }
     }
 }
@@ -100,20 +112,53 @@ fn configure_probes(conf: &Config, programs: &mut Programs, target: KernelVersio
 /// This function is responsible from loading eBPF code from a buffer
 /// into the appropriate Aya structure. It does not load the eBPF code
 /// into the kernel.
+#[cfg_attr(target_arch = "aarch64", allow(unused_variables))]
 pub fn prepare_bpf(
     kernel: KernelVersion,
+    symbols: &KernelSymbols,
     conf: &Config,
     vll: VerifierLogLevel,
-) -> anyhow::Result<Bpf> {
+) -> anyhow::Result<Ebpf> {
     let page_size = page_size()? as u64;
-    let page_shift = page_shift()? as u64;
+    let page_shift = page_shift()?;
 
-    let mut bpf = BpfLoader::new()
+    let mut loader = EbpfLoader::new();
+    loader
         .verifier_log_level(vll)
-        .set_global("PAGE_SHIFT", &page_shift, true)
-        .set_global("PAGE_SIZE", &page_size, true)
-        .set_global("LINUX_KERNEL_VERSION", &kernel, true)
-        .load(BPF_ELF)?;
+        .override_global("PAGE_SHIFT", &page_shift, true)
+        .override_global("PAGE_SIZE", &page_size, true)
+        .override_global("LINUX_KERNEL_VERSION", &kernel, true);
+
+    let mut bpf = cfg_select! {
+       target_arch = "x86_64" => {{
+          let vmemmap_base = symbols.get_data_symbol_addr("vmemmap_base").unwrap_or_else(|| {
+             warn!("could not read vmemmap_base from kallsyms");
+             0
+          });
+
+          let page_offset_base = symbols.get_data_symbol_addr("page_offset_base")
+              .unwrap_or_else(|| {
+                 warn!("could not read page_offset_base from kallsyms");
+                 0
+              });
+
+         debug!(
+            "page VA globals (x86_64): vmemmap_base={vmemmap_base:#x} \
+               page_offset_base={page_offset_base:#x}"
+         );
+
+         // these values are needed to access `page struct` data
+          loader
+              .override_global("VMEMMAP_BASE_PTR", &vmemmap_base, true)
+              .override_global("PAGE_OFFSET_BASE_PTR", &page_offset_base, true);
+
+          loader.load(BPF_ELF)?
+       }}
+
+       _ => {
+          loader.load(BPF_ELF)?
+       }
+    };
 
     BpfConfig::init_config_in_bpf(&mut bpf, conf.clone().try_into()?)
         .expect("failed to initialize bpf configuration");
@@ -126,8 +171,9 @@ pub fn prepare_bpf(
 /// program loader.
 pub fn load_and_attach_bpf<'a>(
     conf: &'a Config,
+    symbols: &KernelSymbols,
     kernel: KernelVersion,
-    bpf: &'a mut Bpf,
+    bpf: &'a mut Ebpf,
 ) -> anyhow::Result<()> {
     // make possible probe selection in debug
     #[allow(unused_mut)]
@@ -141,7 +187,7 @@ pub fn load_and_attach_bpf<'a>(
     let mut programs = Programs::with_bpf(bpf).with_elf_info(BPF_ELF)?;
     let btf = Btf::from_sys_fs()?;
 
-    configure_probes(conf, &mut programs, kernel);
+    configure_probes(conf, symbols, &mut programs, kernel);
 
     // generic program loader
     for (_, p) in programs.sorted_by_prio() {
@@ -192,8 +238,29 @@ pub fn load_and_attach_bpf<'a>(
                 Err(crate::compat::Error::Program(ProgramError::SyscallError(_)))
             )
         {
-            warn!("syscore_resume probe has failed to load, make sure your kernel is compiled without CONFIG_PM_SLEEP")
+            warn!(
+                "syscore_resume probe has failed to load, make sure your kernel is compiled \
+                 without CONFIG_PM_SLEEP"
+            )
         }
+
+        let _ = r.inspect_err(|e| {
+            if let Some(a) = p.attach_point.as_ref() {
+                error!(
+                    "failed to attach probe={} to function={}: verify function exists in your \
+                     kernel",
+                    &p.name, &a
+                )
+            } else {
+                error!("failed to attach probe={}", &p.name)
+            }
+
+            debug!("error for attach failure: {e}");
+
+            if !conf.force_load {
+                panic!("failed to attach probe={}: {e}", &p.name)
+            }
+        });
     }
 
     Ok(())

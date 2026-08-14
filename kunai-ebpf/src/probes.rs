@@ -5,12 +5,12 @@ use kunai_common::{
     bpf_events::*,
     co_re,
     consts::*,
-    error, error_msg,
+    error,
     errors::{self, *},
     inspect_err,
     path::{self, *},
     utils::*,
-    warn, warn_msg,
+    warn,
 };
 
 #[cfg(feature = "debug")]
@@ -25,12 +25,13 @@ mod execve;
 mod exit;
 mod fs;
 mod init_module;
+mod io_uring;
 mod kill;
 mod lsm;
 mod mmap;
 mod mprotect;
 mod prctl;
-mod schedule;
+mod ptrace;
 mod send_data;
 mod syscore_resume;
 
@@ -150,3 +151,11 @@ macro_rules! if_disabled_return {
 }
 
 use if_disabled_return;
+
+#[inline(always)]
+pub(crate) fn is_current_loader_task() -> bool {
+    if let Ok(true) = unsafe { get_cfg!().map(|c| c.current_is_loader()) } {
+        return true;
+    }
+    false
+}

@@ -1,4 +1,5 @@
 use crate::bpf_events::Event;
+use crate::option::BpfOption;
 use crate::{buffer::Buffer, net::SocketInfo, string::String};
 
 pub const KSYM_NAME_LEN: usize = 512;
@@ -26,15 +27,15 @@ pub struct BpfProgData {
     pub attached_func_name: String<512>,
     pub prog_type: u32,
     pub attach_type: u32,
-    pub hashes: Option<ProgHashes>,
-    pub verified_insns: Option<u32>,
+    pub hashes: BpfOption<ProgHashes>,
+    pub verified_insns: BpfOption<u32>,
     pub loaded: bool,
 }
 
-pub type BpfSocketFilterEvent = Event<BpfSocketFilter>;
+pub type BpfSocketFilterEvent = Event<BpfSocketFilterData>;
 
 #[repr(C)]
-pub struct BpfSocketFilter {
+pub struct BpfSocketFilterData {
     pub socket_info: SocketInfo,
     pub filter: Buffer<2048>,
     pub filter_len: u16,

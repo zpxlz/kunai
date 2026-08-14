@@ -1,22 +1,17 @@
-use crate::{
-    errors::ProbeError, macros::bpf_target_code, macros::not_bpf_target_code, utils::cap_size,
-};
+use crate::{errors::ProbeError, option::BpfOption};
 
 use super::time::Time;
-use super::utils::bound_value_for_verifier;
 
 use kunai_macros::BpfError;
 
 #[allow(unused_imports)]
 use core::{cmp::min, ffi::c_long};
 
-not_bpf_target_code! {
-    mod user;
-}
+#[cfg(feature = "user")]
+mod user;
 
-bpf_target_code! {
-    mod bpf;
-}
+#[cfg(target_arch = "bpf")]
+mod bpf;
 
 // for path resolution
 pub const MAX_PATH_DEPTH: u16 = 128;
@@ -33,8 +28,6 @@ pub const MAX_NAME: usize = u8::MAX as usize;
 #[repr(C)]
 #[derive(BpfError, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    #[error("should not happen")]
-    ShouldNotHappen,
     #[error("filename is too long")]
     FileNameTooLong,
     #[error("filepath is too long")]
@@ -81,6 +74,8 @@ pub enum Error {
     DNameNameMissing,
     #[error("d_name.len field missing")]
     DNameLenMissing,
+    #[error("d_name.hash_len field missing")]
+    DNameHashLenMissing,
     #[error("failed to get path ino")]
     PathInoFailure,
     #[error("failed to get path sb ino")]
@@ -125,6 +120,34 @@ pub struct Metadata {
     pub ctime: Time,
 }
 
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct MapKey {
+    hash: u64,
+    // depth is a u32 to force structure alignment
+    // without this kernel 5.4 fails at using this
+    // struct on the eBPF stack
+    depth: u32,
+    len: u32,
+    ino: u64,
+    sb_ino: u64,
+}
+
+impl From<&Path> for MapKey {
+    #[inline(always)]
+    fn from(p: &Path) -> Self {
+        let meta = p.metadata.unwrap_or_default();
+        MapKey {
+            hash: p.hash,
+            depth: p.depth as u32,
+            len: p.len,
+            ino: meta.ino,
+            sb_ino: meta.sb_ino,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Eq)]
 pub struct Path {
@@ -133,38 +156,31 @@ pub struct Path {
     len: u32,
     depth: u16,
     real: bool, // flag if path is a realpath
-    pub metadata: Option<Metadata>,
+    pub hash: u64,
+    pub metadata: BpfOption<Metadata>,
     pub mode: Mode,
-    pub error: Option<Error>,
+    pub error: BpfOption<Error>,
 }
 
 impl PartialEq for Path {
     fn eq(&self, other: &Self) -> bool {
-        let meta_eq = {
-            if self.metadata.is_none() && other.metadata.is_none() {
-                return true;
+        let meta_eq = match (self.metadata, other.metadata) {
+            (BpfOption::Some(sm), BpfOption::Some(om)) => {
+                sm.ino == om.ino
+                    && sm.sb_ino == om.sb_ino
+                    && sm.size == om.size
+                    && sm.mtime == om.mtime
+                    && sm.ctime == om.ctime
             }
-
-            if let Some(sm) = self.metadata {
-                if let Some(om) = other.metadata {
-                    // we don't consider atime (access time)
-                    // as being relevant for path Eq checking
-                    return sm.ino == om.ino
-                        && sm.sb_ino == om.sb_ino
-                        && sm.size == om.size
-                        && sm.mtime == om.mtime
-                        && sm.ctime == om.ctime;
-                }
-            }
-
-            false
+            (BpfOption::None, BpfOption::None) => true,
+            _ => false,
         };
 
-        self.buffer == other.buffer
+        meta_eq
             && self.len == other.len
             && self.depth == other.depth
             && self.real == other.real
-            && meta_eq
+            && self.buffer == other.buffer
     }
 }
 
@@ -175,16 +191,22 @@ impl Default for Path {
             null: 0,
             len: 0,
             depth: 0,
+            hash: 0,
             real: false,
-            metadata: None,
+            metadata: BpfOption::None,
             mode: Mode::Append,
-            error: None,
+            error: BpfOption::None,
         }
     }
 }
 
 // common implementation
 impl Path {
+    #[inline(always)]
+    pub fn map_key(&self) -> MapKey {
+        MapKey::from(self)
+    }
+
     pub fn copy_from_str<T: AsRef<str>>(
         &mut self,
         s: T,
@@ -195,7 +217,7 @@ impl Path {
 
         self.len = 0;
         self.mode = mode;
-        self.error = None;
+        self.error = BpfOption::None;
 
         let mut start = 0;
         if matches!(mode, Mode::Prepend) {
@@ -206,7 +228,7 @@ impl Path {
         self.len = n as u32;
 
         if src.len() > self.buffer.len() {
-            self.error = Some(Error::TruncPath);
+            self.error = BpfOption::Some(Error::TruncPath);
             return Err(n);
         }
 
@@ -254,10 +276,18 @@ impl Path {
             }
         };
 
-        // bound checking
+        #[cfg(target_arch = "bpf")]
+        {
+            let i = i as i64;
+            if aya_ebpf::check_bounds_signed(i, 0, self.buffer.len() as i64) {
+                return Ok(unsafe { *self.buffer.get_unchecked(i as usize) });
+            }
+        };
+
+        #[cfg(not(target_arch = "bpf"))]
         if i < self.buffer.len() {
             return Ok(unsafe { *self.buffer.get_unchecked(i) });
-        }
+        };
 
         Err(Error::OutOfBound)
     }
@@ -291,12 +321,11 @@ impl Path {
     pub fn as_slice(&self) -> &[u8] {
         match self.mode {
             Mode::Append => {
-                let len =
-                    bound_value_for_verifier(self.len as isize, 0, self.buffer.len() as isize);
-                &self.buffer[..len as usize]
+                let len = (self.len as usize).clamp(0, self.buffer.len());
+                &self.buffer[..len]
             }
             Mode::Prepend => {
-                let len = cap_size(self.len(), MAX_PATH_LEN - 255);
+                let len = self.len().clamp(0, MAX_PATH_LEN - 255);
                 &self.buffer[(self.buffer.len() - len)..]
             }
         }
@@ -312,6 +341,7 @@ impl Path {
 }
 
 #[cfg(test)]
+#[cfg(feature = "user")]
 mod test {
 
     use super::*;

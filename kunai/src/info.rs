@@ -2,26 +2,35 @@ use std::io;
 
 use chrono::{DateTime, Utc};
 use kunai_common::{
-    bpf_events::{self, EventInfo},
-    uuid::TaskUuid,
+    bpf_events::{self, EventInfo, TaskInfo},
+    uuid::ProcUuid,
 };
 use thiserror::Error;
 
-use crate::{containers::Container, util::get_clk_tck};
+use crate::{
+    containers::Container,
+    util::{
+        account::{Group, User},
+        get_clk_tck,
+    },
+};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub struct TaskKey {
+pub struct ProcKey {
     start_time_sec: u64,
+    // this is the userland process ID in kernel
+    // it corresponds to the task's tgid (task group id)
     pid: u32,
 }
 
-impl From<TaskUuid> for TaskKey {
-    fn from(value: TaskUuid) -> Self {
+impl From<ProcUuid> for ProcKey {
+    #[inline(always)]
+    fn from(value: ProcUuid) -> Self {
         // in task_struct start_time has a higher resolution so we need to scale it
         // down in order to have a comparable value with the procfs one
         Self {
-            start_time_sec: value.start_time_ns / 1_000_000_000,
-            pid: value.pid,
+            start_time_sec: value.leader_start_time_ns / 1_000_000_000,
+            pid: value.tgid,
         }
     }
 }
@@ -34,8 +43,9 @@ pub enum KeyError {
     Io(#[from] io::Error),
 }
 
-impl TryFrom<&procfs::process::Process> for TaskKey {
+impl TryFrom<&procfs::process::Process> for ProcKey {
     type Error = KeyError;
+    #[inline(always)]
     fn try_from(p: &procfs::process::Process) -> Result<Self, Self::Error> {
         let stat = p.stat()?;
         // panic here if we cannot get CLK_TCK
@@ -61,27 +71,51 @@ pub struct ContainerInfo {
 }
 
 #[derive(Default, Debug, Clone)]
+pub struct TaskAdditionalInfo {
+    pub user: Option<User>,
+    pub group: Option<Group>,
+}
+
+impl TaskAdditionalInfo {
+    pub fn new(user: Option<User>, group: Option<Group>) -> Self {
+        Self { user, group }
+    }
+}
+
+#[derive(Default, Debug, Clone)]
 pub struct AdditionalInfo {
     pub host: HostInfo,
     pub container: Option<ContainerInfo>,
+    pub task: TaskAdditionalInfo,
+    pub parent: TaskAdditionalInfo,
 }
 
 #[derive(Default, Debug, Clone)]
 pub struct StdEventInfo {
-    pub info: bpf_events::EventInfo,
+    pub bpf: bpf_events::EventInfo,
     pub additional: AdditionalInfo,
     pub utc_timestamp: DateTime<Utc>,
 }
 
 impl StdEventInfo {
     #[inline(always)]
-    pub fn task_key(&self) -> TaskKey {
-        TaskKey::from(self.info.process.tg_uuid)
+    pub fn task_info(&self) -> &TaskInfo {
+        &self.bpf.process
     }
 
     #[inline(always)]
-    pub fn parent_key(&self) -> TaskKey {
-        TaskKey::from(self.info.parent.tg_uuid)
+    pub fn parent_info(&self) -> &TaskInfo {
+        &self.bpf.parent
+    }
+
+    #[inline(always)]
+    pub fn process_key(&self) -> ProcKey {
+        ProcKey::from(self.task_info().tg_uuid)
+    }
+
+    #[inline(always)]
+    pub fn parent_key(&self) -> ProcKey {
+        ProcKey::from(self.parent_info().tg_uuid)
     }
 
     #[inline]
@@ -90,7 +124,7 @@ impl StdEventInfo {
         info.set_uuid_random(rand);
 
         StdEventInfo {
-            info,
+            bpf: info,
             // on older kernels bpf_ktime_get_boot_ns() is not available so it is not
             // easy to compute correct event timestamp from eBPF so utc_timestamp is
             // the time at which the event is processed.

@@ -52,6 +52,9 @@ pub use core_files_struct::*;
 mod core_page;
 pub use core_page::*;
 
+mod core_io_uring;
+pub use core_io_uring::*;
+
 #[derive(Clone, Copy)]
 pub struct CoRe<P> {
     ptr: *const P,
@@ -77,17 +80,12 @@ impl<P> From<*const P> for CoRe<P> {
 
 impl<P> CoRe<P> {
     #[inline(always)]
-    pub unsafe fn bpf_read(&self) -> Result<*const P, i64> {
-        aya_ebpf::helpers::bpf_probe_read(&self.ptr)
-    }
-
-    #[inline(always)]
     pub fn is_null(&self) -> bool {
         self.ptr.is_null()
     }
 
     pub fn as_ptr(&self) -> *const P {
-        self.ptr as *mut _
+        self.ptr
     }
 
     fn as_ptr_mut(&self) -> *mut P {
@@ -112,6 +110,7 @@ macro_rules! rust_shim_kernel_impl {
 
     ($pub:vis, $fn_name:ident, $struct: ident, $member:ident, $ret:ty) => {
         #[inline(always)]
+        #[allow(clippy::len_without_is_empty)]
         $pub unsafe fn $fn_name(&self) -> Option<$ret> {
             if !self.is_null()
                 && paste::paste! {[<shim_ $struct _ $member _exists>]}(self.as_ptr_mut())

@@ -3,15 +3,28 @@ use kunai_common::{buffer, co_re::task_struct, kprobe::ProbeFn};
 
 use super::*;
 
+/// match-proto:v5.0:security/security.c:int security_task_alloc(struct task_struct *task, unsigned long clone_flags)
+/// match-proto:v6.17:security/security.c:int security_task_alloc(struct task_struct *task, unsigned long clone_flags)
+/// match-proto:latest:security/security.c:int security_task_alloc(struct task_struct *task, u64 clone_flags)
 #[kprobe(function = "security_task_alloc")]
 pub fn clone_enter_security_task_alloc(ctx: ProbeContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     // we just save kprobe context
     unsafe { ignore_result!(ProbeFn::security_task_alloc.save_ctx(&ctx)) }
     errors::BPF_PROG_SUCCESS
 }
 
+/// match-proto:v5.0:kernel/sched/core.c:void wake_up_new_task(struct task_struct *p)
+/// match-proto:latest:kernel/sched/core.c:void wake_up_new_task(struct task_struct *p)
 #[kprobe(function = "wake_up_new_task")]
 pub fn clone_enter_wake_up_new_task(ctx: ProbeContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     let rc = match unsafe { try_enter_wake_up_new_task(&ctx) } {
         Ok(_) => errors::BPF_PROG_SUCCESS,
         Err(s) => {

@@ -8,8 +8,15 @@ use kunai_common::syscalls::{SysEnterArgs, SysExitArgs};
 static mut INIT_MODULE_TRACKING: LruHashMap<u64, InitModuleEvent> =
     LruHashMap::with_max_entries(1024, 0);
 
+/// match-proto:v5.0:kernel/module.c:static int mod_sysfs_setup(struct module *mod, const struct load_info *info, struct kernel_param *kparam, unsigned int num_params)
+/// match-proto:v5.19:kernel/module/sysfs.c:int mod_sysfs_setup(struct module *mod, const struct load_info *info, struct kernel_param *kparam, unsigned int num_params)
+/// match-proto:latest:kernel/module/sysfs.c:int mod_sysfs_setup(struct module *mod, const struct load_info *info, struct kernel_param *kparam, unsigned int num_params)
 #[kprobe(function = "mod_sysfs_setup")]
 pub fn lkm_mod_sysfs_setup(ctx: ProbeContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     match unsafe { try_mod_sysfs_setup(&ctx) } {
         Ok(_) => errors::BPF_PROG_SUCCESS,
         Err(s) => {
@@ -38,6 +45,10 @@ unsafe fn try_mod_sysfs_setup(ctx: &ProbeContext) -> ProbeResult<()> {
 
 #[tracepoint(name = "sys_enter_init_module", category = "syscalls")]
 pub fn lkm_syscalls_sys_enter_init_module(ctx: TracePointContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     match unsafe { try_sys_enter_init_module(&ctx) } {
         Ok(_) => errors::BPF_PROG_SUCCESS,
         Err(s) => {
@@ -54,6 +65,10 @@ unsafe fn try_sys_enter_init_module(ctx: &TracePointContext) -> ProbeResult<()> 
 
 #[tracepoint(name = "sys_enter_finit_module", category = "syscalls")]
 pub fn lkm_syscalls_sys_enter_finit_module(ctx: TracePointContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     match unsafe { try_sys_enter_finit_module(&ctx) } {
         Ok(_) => errors::BPF_PROG_SUCCESS,
         Err(s) => {
@@ -85,7 +100,7 @@ unsafe fn handle_init_module(ctx: &TracePointContext, args: InitModuleArgs) -> P
             .data
             .uargs
             .read_user_str_bytes(args.uargs() as *const u8),
-        |_| warn_msg!(ctx, "failed to read uargs")
+        |_| warn!(ctx, "failed to read uargs")
     ));
 
     // setting event data
@@ -100,6 +115,10 @@ unsafe fn handle_init_module(ctx: &TracePointContext, args: InitModuleArgs) -> P
 
 #[tracepoint(name = "sys_exit_init_module", category = "syscalls")]
 pub fn lkm_syscalls_sys_exit_init_module(ctx: TracePointContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     match unsafe { try_sys_exit_init_module(&ctx) } {
         Ok(_) => errors::BPF_PROG_SUCCESS,
         Err(s) => {
@@ -111,6 +130,10 @@ pub fn lkm_syscalls_sys_exit_init_module(ctx: TracePointContext) -> u32 {
 
 #[tracepoint(name = "sys_exit_finit_module", category = "syscalls")]
 pub fn lkm_syscalls_sys_exit_finit_module(ctx: TracePointContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     match unsafe { try_sys_exit_init_module(&ctx) } {
         Ok(_) => errors::BPF_PROG_SUCCESS,
         Err(s) => {
@@ -128,7 +151,7 @@ unsafe fn try_sys_exit_init_module(ctx: &TracePointContext) -> ProbeResult<()> {
         let event = &mut (*event);
         // we set a default value for driver name
         if event.data.name.is_empty() {
-            event.data.name.push_bytes_unchecked("?");
+            ignore_result!(event.data.name.push_char('?'));
         }
         event.data.loaded = args.ret == 0;
         pipe_event(ctx, event);

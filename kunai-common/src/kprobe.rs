@@ -1,12 +1,13 @@
 use kunai_macros::BpfError;
 
-use crate::{errors::ProbeError, macros::bpf_target_code};
+use crate::errors::ProbeError;
 
-bpf_target_code! {
-    mod bpf;
-    pub use bpf::*;
-}
+#[cfg(target_arch = "bpf")]
+mod bpf;
+#[cfg(target_arch = "bpf")]
+pub use bpf::*;
 
+#[repr(C)]
 #[derive(BpfError, Clone, Copy)]
 pub enum Error {
     #[error("failed to insert ctx")]

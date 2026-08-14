@@ -1,8 +1,9 @@
 use core::cmp::min;
 
 use crate::co_re::{bio_vec, iov_iter, iovec};
+use crate::utils::verifier_clamp;
 use aya_ebpf::check_bounds_signed;
-use aya_ebpf::helpers::{gen, *};
+use aya_ebpf::helpers::{generated, *};
 
 use super::{Buffer, Error};
 
@@ -11,7 +12,6 @@ impl<const N: usize> Buffer<N> {
     pub unsafe fn fill_from_iov_iter<const MAX_NR_SEGS: usize>(
         &mut self,
         iter: iov_iter,
-        count: Option<usize>,
     ) -> Result<(), Error> {
         let nr_segs = iter.nr_segs().ok_or(Error::NrSegsMissing)? as usize;
 
@@ -33,7 +33,7 @@ impl<const N: usize> Buffer<N> {
                 if self.is_full() || i >= nr_segs {
                     break;
                 }
-                self.append_iov(iov.get(i), count)?;
+                self.append_iov(iov.get(i))?;
             }
         } else if iter.is_iter_bvec() {
             let bvec = iter.bvec().ok_or(Error::BvecMissing)?;
@@ -42,7 +42,7 @@ impl<const N: usize> Buffer<N> {
                 if self.is_full() || i >= nr_segs {
                     break;
                 }
-                self.append_bio_vec(bvec.get(i), count)?;
+                self.append_bio_vec(bvec.get(i))?;
             }
         } else {
             return Err(Error::UnimplementedIter);
@@ -52,27 +52,19 @@ impl<const N: usize> Buffer<N> {
     }
 
     #[inline(always)]
-    unsafe fn append_iov(&mut self, iov: iovec, count: Option<usize>) -> Result<(), Error> {
+    unsafe fn append_iov(&mut self, iov: iovec) -> Result<(), Error> {
         let iov_len = iov.iov_len().ok_or(Error::IovLenMissing)?;
         let iov_base = iov.iov_base().ok_or(Error::IovBaseMissing)?;
 
-        let len = self.len as i64;
+        let size = min(iov_len as i64, self.space_left() as i64);
 
-        let mut size = iov_len as i64;
+        // verifier massage: offset can never be greater than buf capacity
+        let offset = verifier_clamp(self.len() as i64, 0, N as i64) as usize;
 
-        if let Some(count) = count {
-            size = min(count as i64, size);
-        }
-
-        let left = N as i64 - len;
-        if size > left {
-            return Err(Error::BufferFull);
-        }
-
-        if check_bounds_signed(len, 0, N as i64) && check_bounds_signed(size, 1, N as i64) {
-            if gen::bpf_probe_read_user(
-                self.buf[len as usize..N].as_mut_ptr() as *mut _,
-                size as u32,
+        if let Some(dst) = self.buf.get_mut(offset..N).map(|d| d.as_mut_ptr()) {
+            if generated::bpf_probe_read_user(
+                dst as *mut _,
+                verifier_clamp(size, 0, N as i64) as u32,
                 iov_base as *const _,
             ) < 0
             {
@@ -81,35 +73,33 @@ impl<const N: usize> Buffer<N> {
 
             self.len += size as usize;
         }
-
         Ok(())
     }
 
     #[inline(always)]
-    unsafe fn append_bio_vec(&mut self, bvec: bio_vec, count: Option<usize>) -> Result<(), Error> {
+    unsafe fn append_bio_vec(&mut self, bvec: bio_vec) -> Result<(), Error> {
         let page = bvec.bv_page().ok_or(Error::BvecPageMissing)?;
-        let bv_offset = bvec.bv_len().ok_or(Error::BvecOffsetMissing)?;
+        let bv_offset = bvec.bv_offset().ok_or(Error::BvecOffsetMissing)?;
         let bv_len = bvec.bv_len().ok_or(Error::BvecLenMissing)?;
 
-        let bvec_base = (page.to_va() as u64).wrapping_add(bv_offset as u64);
+        let bvec_data = if let Some(pa) = page.page_to_virt() {
+            if pa.is_null() {
+                return Err(Error::BvecNullBase);
+            }
+            pa.byte_offset(bv_offset as isize)
+        } else {
+            return Err(Error::UnsupportedArch);
+        };
 
-        let len = self.len as i64;
-        let mut size = bv_len as i64;
+        let size = min(self.space_left() as i64, bv_len as i64);
 
-        if let Some(count) = count {
-            size = min(count as i64, size);
-        }
+        let offset = verifier_clamp(self.len() as i64, 0, N as i64) as usize;
 
-        let left = N as i64 - len;
-        if size > left {
-            return Err(Error::BufferFull);
-        }
-
-        if check_bounds_signed(len, 0, N as i64) && check_bounds_signed(size, 1, N as i64) {
-            if gen::bpf_probe_read_kernel(
-                self.buf[len as usize..N].as_mut_ptr() as *mut _,
-                size as u32,
-                bvec_base as *const _,
+        if let Some(dst) = self.buf.get_mut(offset..N).map(|d| d.as_mut_ptr()) {
+            if generated::bpf_probe_read_kernel(
+                dst as *mut _,
+                verifier_clamp(size, 0, N as i64) as u32,
+                bvec_data,
             ) < 0
             {
                 return Err(Error::FailedToReadBioVec);
@@ -117,7 +107,6 @@ impl<const N: usize> Buffer<N> {
 
             self.len += size as usize;
         }
-
         Ok(())
     }
 
@@ -132,8 +121,8 @@ impl<const N: usize> Buffer<N> {
     pub unsafe fn read_user_at<P>(&mut self, from: *const P, size: u32) -> Result<(), Error> {
         let size = (size as i64).clamp(0, N as i64);
 
-        if check_bounds_signed(size as i64, 0, N as i64) {
-            let ret = gen::bpf_probe_read_user(
+        if check_bounds_signed(size, 0, N as i64) {
+            let ret = generated::bpf_probe_read_user(
                 self.buf.as_mut_ptr() as *mut _,
                 size as u32,
                 from as *const _,
@@ -151,8 +140,8 @@ impl<const N: usize> Buffer<N> {
     pub unsafe fn read_kernel_at<P>(&mut self, from: *const P, size: u32) -> Result<(), Error> {
         let size = (size as i64).clamp(0, N as i64);
 
-        if check_bounds_signed(size as i64, 0, N as i64) {
-            let ret = gen::bpf_probe_read_kernel(
+        if check_bounds_signed(size, 0, N as i64) {
+            let ret = generated::bpf_probe_read_kernel(
                 self.buf.as_mut_ptr() as *mut _,
                 size as u32,
                 from as *const _,

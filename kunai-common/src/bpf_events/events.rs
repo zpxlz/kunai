@@ -1,5 +1,4 @@
 use super::Type;
-use crate::macros::not_bpf_target_code;
 
 // events we want to be accesible
 mod connect;
@@ -30,18 +29,28 @@ mod mount;
 pub use mount::*;
 mod prctl;
 pub use prctl::*;
-pub mod error;
-pub use error::{ErrorData, ErrorEvent};
+pub mod log;
+pub use log::{LogData, LogEvent};
 mod syscore_resume;
 pub use syscore_resume::*;
 mod kill;
 pub use kill::*;
+mod ptrace;
+pub use ptrace::*;
+pub mod error;
+pub use error::*;
+mod loss;
+pub use loss::*;
+mod status;
+pub use status::*;
+mod io_uring;
+pub use io_uring::*;
 
 // prevent using correlation event in bpf code
-not_bpf_target_code! {
-    mod correlation;
-    pub use correlation::*;
-}
+#[cfg(feature = "user")]
+mod correlation;
+#[cfg(feature = "user")]
+pub use correlation::*;
 
 // used to pipe events to userland
 mod perfs;
@@ -61,11 +70,11 @@ const fn max_bpf_event_size() -> usize {
         }
         let size = match variants[i] {
             Type::Execve | Type::ExecveScript => ExecveEvent::size_of(),
-            Type::TaskSched => ScheduleEvent::size_of(),
             Type::Exit | Type::ExitGroup => ExitEvent::size_of(),
             Type::Clone => CloneEvent::size_of(),
             Type::Prctl => PrctlEvent::size_of(),
             Type::Kill => KillEvent::size_of(),
+            Type::Ptrace => PtraceEvent::size_of(),
             Type::InitModule => InitModuleEvent::size_of(),
             Type::BpfProgLoad => BpfProgLoadEvent::size_of(),
             Type::BpfSocketFilter => BpfSocketFilterEvent::size_of(),
@@ -78,9 +87,14 @@ const fn max_bpf_event_size() -> usize {
             | Type::ReadConfig
             | Type::Write
             | Type::WriteConfig
-            | Type::WriteAndClose => FileEvent::size_of(),
+            | Type::WriteClose
+            | Type::FileCreate => FileEvent::size_of(),
             Type::FileRename => FileRenameEvent::size_of(),
             Type::FileUnlink => UnlinkEvent::size_of(),
+            Type::IoUringSqe => IoUringSqeEvent::size_of(),
+            Type::Log => LogEvent::size_of(),
+            Type::Start => StatusEvent::size_of(),
+            Type::Loss => LossEvent::size_of(),
             Type::Error => ErrorEvent::size_of(),
             Type::SyscoreResume => SysCoreResumeEvent::size_of(),
             // these are event types only used in user land

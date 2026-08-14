@@ -1,12 +1,24 @@
-use core::str::FromStr;
 use huby::ByteSize;
 use kunai_common::{
     bpf_events,
     config::{BpfConfig, Filter, Loader},
 };
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::{
+    collections::BTreeMap,
+    env::var,
+    fs,
+    ops::{Div, Mul},
+    path::PathBuf,
+    str::FromStr,
+    time::Duration,
+};
 use thiserror::Error;
+
+use crate::util::{
+    serde::{deserialize_opt_duration, serialize_opt_duration},
+    sha256_data,
+};
 
 pub const DEFAULT_SEND_DATA_MIN_LEN: u64 = 256;
 pub const DEFAULT_MAX_BUFFERED_EVENTS: u16 = 1024;
@@ -21,16 +33,10 @@ pub enum Error {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Event {
-    name: String,
     enable: bool,
 }
 
 impl Event {
-    #[inline(always)]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     #[inline(always)]
     pub fn disable(&mut self) {
         self.enable = false
@@ -48,74 +54,104 @@ impl Event {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct FileSettings {
-    pub rotate_size: ByteSize,
-    pub max_size: ByteSize,
+pub struct Output {
+    pub path: String,
+    pub rotate_size: Option<ByteSize>,
+    #[serde(
+        serialize_with = "serialize_opt_duration",
+        deserialize_with = "deserialize_opt_duration"
+    )]
+    pub rotate_interval: Option<Duration>,
+    pub max_size: Option<ByteSize>,
+    pub buffered: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Scanner {
+    pub rules: Vec<PathBuf>,
+    pub iocs: Vec<PathBuf>,
+    pub yara: Vec<PathBuf>,
+    pub min_severity: u8,
+    pub show_positive_file_scan: bool,
 }
 
 /// Kunai configuration structure to be used in userland
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
-    host_uuid: Option<uuid::Uuid>,
-    pub output: String,
-    pub output_settings: Option<FileSettings>,
+    pub host_uuid: uuid::Uuid,
     pub max_buffered_events: u16,
+    pub max_eps_fs: Option<u64>,
     pub workers: Option<usize>,
     pub send_data_min_len: Option<u64>,
-    pub rules: Vec<String>,
-    pub iocs: Vec<String>,
-    pub yara: Vec<String>,
-    pub always_show_positive_scans: bool,
     pub harden: bool,
-    pub events: Vec<Event>,
+    pub force_load: bool,
+    pub output: Output,
+    pub scanner: Scanner,
+    pub events: BTreeMap<bpf_events::Type, Event>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        let mut events = vec![];
+        let mut events = BTreeMap::new();
         for v in bpf_events::Type::variants() {
             // some events get disabled by default because there are too many
             let en = !matches!(
                 v,
-                bpf_events::Type::Read | bpf_events::Type::Write | bpf_events::Type::WriteAndClose
+                bpf_events::Type::Read | bpf_events::Type::Write | bpf_events::Type::WriteClose
             );
 
             if v.is_configurable() {
-                events.push(Event {
-                    name: v.as_str().into(),
-                    enable: en,
-                })
+                events.insert(v, Event { enable: en });
             }
         }
 
         Self {
-            host_uuid: None,
-            output: "/dev/stdout".into(),
-            output_settings: None,
+            host_uuid: Config::default_host_uuid(),
             max_buffered_events: DEFAULT_MAX_BUFFERED_EVENTS,
+            // this x2 rule generally works for small values of max_buffered_events
+            max_eps_fs: Some(DEFAULT_MAX_BUFFERED_EVENTS as u64 * 2),
             workers: None,
             send_data_min_len: None,
-            rules: vec![],
-            iocs: vec![],
-            yara: vec![],
-            always_show_positive_scans: true,
             harden: false,
+            force_load: false,
+            scanner: Scanner {
+                rules: vec![],
+                iocs: vec![],
+                yara: vec![],
+                min_severity: 0,
+                show_positive_file_scan: true,
+            },
+            output: Output {
+                path: "/dev/stdout".into(),
+                max_size: None,
+                rotate_size: None,
+                rotate_interval: None,
+                buffered: false,
+            },
             events,
         }
     }
 }
 
-fn host_uuid() -> Option<uuid::Uuid> {
+fn derive_uuid_from<B: AsRef<[u8]>>(bytes: B) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, bytes.as_ref())
+}
+
+fn host_uuid_from_machine_id() -> Option<uuid::Uuid> {
     if let Ok(machine_id) = fs::read_to_string("/etc/machine-id") {
         let machine_id = machine_id.trim_end();
         // we do not generate uuid if machine_id is empty string
         if machine_id.is_empty() {
             return None;
         }
-        return Some(uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_OID,
-            machine_id.as_bytes(),
-        ));
+        return Some(derive_uuid_from(machine_id));
+    }
+    None
+}
+
+fn host_uuid_from_boot_id() -> Option<uuid::Uuid> {
+    if let Ok(boot_id) = fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+        return uuid::Uuid::from_str(boot_id.trim_end()).ok();
     }
     None
 }
@@ -128,47 +164,49 @@ impl Config {
         }
     }
 
-    pub fn host_uuid(&self) -> Option<uuid::Uuid> {
-        // host_uuid in config supersedes system host_uuid
-        self.host_uuid.or(host_uuid())
+    fn default_host_uuid() -> uuid::Uuid {
+        var("KUNAI_HOST_UUID_SEED")
+            .ok()
+            .map(|seed| derive_uuid_from(&seed))
+            .or(host_uuid_from_machine_id())
+            // allow to at least have something stable accross runs
+            .or(host_uuid_from_boot_id())
+            .unwrap_or(uuid::Uuid::new_v4())
     }
 
-    pub fn stdout_output(mut self) -> Self {
-        self.output = "stdout".into();
+    pub fn harden(mut self, value: bool) -> Self {
+        self.harden = value;
         self
     }
 
-    pub fn generate_host_uuid(&mut self) {
-        self.host_uuid = host_uuid().or(Some(uuid::Uuid::new_v4()));
+    pub fn output(mut self, o: Output) -> Self {
+        self.output = o;
+        self
     }
 
-    pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
-        toml::to_string(self)
-    }
-
-    pub fn from_toml<S: AsRef<str>>(toml: S) -> Result<Self, toml::de::Error> {
-        toml::from_str(toml.as_ref())
-    }
-
-    pub fn validate(&self) -> Result<(), Error> {
-        for e in self.events.iter() {
-            let Ok(ty) = bpf_events::Type::from_str(&e.name) else {
-                return Err(Error::InvalidEvent(e.name.clone()));
-            };
-
-            if !ty.is_configurable() {
-                return Err(Error::InvalidEvent(e.name.clone()));
-            }
-        }
-        Ok(())
+    pub fn stdout_output(mut self) -> Self {
+        self.output = Output {
+            path: "stdout".into(),
+            max_size: None,
+            rotate_size: None,
+            rotate_interval: None,
+            buffered: false,
+        };
+        self
     }
 
     pub fn enable_all(&mut self) {
-        self.events.iter_mut().for_each(|e| e.enable())
+        self.events.iter_mut().for_each(|(_, e)| e.enable())
     }
 
     pub fn disable_all(&mut self) {
-        self.events.iter_mut().for_each(|e| e.disable())
+        self.events.iter_mut().for_each(|(_, e)| e.disable())
+    }
+
+    /// Serialize the configuration in yaml then
+    /// computes the sha256 of it
+    pub fn sha256(&self) -> Result<String, serde_yaml::Error> {
+        serde_yaml::to_string(self).map(sha256_data)
     }
 }
 
@@ -186,13 +224,10 @@ impl TryFrom<&Config> for Filter {
     fn try_from(value: &Config) -> Result<Self, Error> {
         let mut filter = Filter::all_disabled();
 
-        for e in value.events.iter() {
-            // config should have been verified so it should not fail
-            let ty = bpf_events::Type::from_str(&e.name)
-                .map_err(|_| Error::InvalidEvent(e.name.clone()))?;
+        for (ty, e) in value.events.iter() {
             // we enable event in BpfConfig only if it has been configured
             if e.enable {
-                filter.enable(ty);
+                filter.enable(*ty);
             }
         }
 
@@ -215,6 +250,8 @@ impl TryFrom<&Config> for BpfConfig {
         Ok(Self {
             loader: Loader::from_own_pid(),
             filter: value.try_into()?,
+            glob_max_eps_fs: value.max_eps_fs,
+            task_max_eps_fs: value.max_eps_fs.map(|m| m.mul(2).div(3)),
             send_data_min_len: value.send_data_min_len.unwrap_or(DEFAULT_SEND_DATA_MIN_LEN),
         })
     }
@@ -222,6 +259,9 @@ impl TryFrom<&Config> for BpfConfig {
 
 #[cfg(test)]
 mod test {
+
+    use serde_yaml;
+    use std::collections::BTreeMap;
 
     use super::*;
 
@@ -231,15 +271,43 @@ mod test {
             ..Default::default()
         };
 
-        config.validate().unwrap();
+        println!("{}", serde_yaml::to_string(&config).unwrap());
+    }
 
-        println!("{}", toml::to_string_pretty(&config).unwrap());
+    #[test]
+    fn test_serialize_btreemap() {
+        let mut config = BTreeMap::<String, isize>::new();
+        config.insert("c".into(), 0);
+        config.insert("b".into(), 1);
+        config.insert("a".into(), 2);
+
+        println!("{}", serde_yaml::to_string(&config).unwrap());
     }
 
     #[test]
     fn test_machine_uuid() {
-        let uuid = host_uuid();
+        let uuid = host_uuid_from_machine_id();
         assert!(uuid.is_some());
         println!("machine uuid: {}", uuid.unwrap())
+    }
+
+    #[test]
+    fn test_boot_id_uuid() {
+        let uuid = host_uuid_from_boot_id();
+        assert!(uuid.is_some());
+        println!("machine uuid: {}", uuid.unwrap())
+    }
+
+    #[test]
+    fn test_duration_in_config() {
+        let mut config = Config {
+            ..Default::default()
+        };
+
+        config.output.rotate_interval = Some(Duration::from_mins(15));
+        let yaml_config = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml_config.contains("rotate_interval: 15m"));
+        config = serde_yaml::from_str(&yaml_config).unwrap();
+        assert_eq!(config.output.rotate_interval, Some(Duration::from_mins(15)));
     }
 }

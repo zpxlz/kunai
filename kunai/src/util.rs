@@ -1,23 +1,57 @@
 use core::mem::{size_of, MaybeUninit};
 use ip_network::IpNetwork;
+use libc::{clock_gettime, rlimit, timespec, CLOCK_MONOTONIC};
 use md5::{Digest, Md5};
 use sha1::Sha1;
 use sha2::{Sha256, Sha512};
-use std::{fs, io, net::IpAddr};
+use std::{
+    fs,
+    io::{self, Write},
+    net::IpAddr,
+};
+use thiserror::Error;
 
+pub mod account;
 pub mod bpf;
-pub mod defer;
 pub mod elf;
-pub mod namespaces;
+pub mod namespace;
+pub mod serde;
 pub mod uname;
+pub mod uptime;
+
+#[allow(non_camel_case_types)]
+#[cfg(target_env = "musl")]
+type rlimit_resource_t = i32;
+
+#[allow(non_camel_case_types)]
+#[cfg(not(target_env = "musl"))]
+type rlimit_resource_t = u32;
 
 #[inline]
 pub fn is_public_ip(ip: IpAddr) -> bool {
     let ip_network: IpNetwork = ip.into();
 
     match ip_network {
-        IpNetwork::V4(v4) => !v4.is_private(),
-        IpNetwork::V6(v6) => !v6.is_unique_local(),
+        IpNetwork::V4(v4) => v4.is_global(),
+        IpNetwork::V6(v6) => v6.is_global(),
+    }
+}
+
+/// Function getting time since boot expressed in nanoseconds. Does not include
+/// suspended time. Uses `CLOCK_MONOTONIC`, the same clock domain as eBPF's
+/// `bpf_ktime_get_ns()`, so values returned here are directly comparable
+/// with timestamps captured on the kernel side.
+pub fn ktime_get_ns() -> Result<u64, io::Error> {
+    let mut ts: timespec = unsafe { std::mem::zeroed() };
+
+    // Call clock_gettime with CLOCK_MONOTONIC
+    let result = unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+
+    if result == 0 {
+        // Convert seconds and nanoseconds to total nanoseconds
+        Ok((ts.tv_sec as u64 * 1_000_000_000).wrapping_add(ts.tv_nsec as u64))
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -50,9 +84,11 @@ pub fn page_shift() -> Result<u64, io::Error> {
     Ok(page_shift)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum RandError {
+    #[error("getrandom call failure")]
     CallFailure,
+    #[error("getrandom partially randomized")]
     PartiallyRandomized,
 }
 
@@ -75,6 +111,30 @@ pub fn getrandom<T: Sized>() -> Result<T, RandError> {
 
 pub fn kill(pid: i32, sig: i32) -> Result<(), io::Error> {
     if unsafe { libc::kill(pid, sig) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[inline(always)]
+pub fn getrlimit(resource: rlimit_resource_t) -> Result<rlimit, io::Error> {
+    let mut rlim: rlimit = rlimit {
+        rlim_cur: 0, // Set the soft limit to 0 initially
+        rlim_max: 0, // Set the hard limit to 0 initially
+    };
+
+    // Get the current limit
+    if unsafe { libc::getrlimit(resource, &mut rlim) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(rlim)
+}
+
+#[inline(always)]
+pub fn setrlimit(resource: rlimit_resource_t, rlimit: rlimit) -> Result<(), io::Error> {
+    // Set the new limit
+    if unsafe { libc::setrlimit(resource, &rlimit) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -113,6 +173,21 @@ pub fn is_bpf_lsm_enabled() -> Result<bool, io::Error> {
     Ok(fs::read_to_string("/sys/kernel/security/lsm")?
         .split(',')
         .any(|s| s == "bpf"))
+}
+
+pub fn ask_yes_no(question: &str, def: bool) -> Result<bool, io::Error> {
+    let mut input = String::new();
+
+    let yn = if def { "[Y/n]" } else { "[y/N]" };
+    print!("{question} {yn}: ");
+    io::stdout().flush()?;
+    io::stdin().read_line(&mut input)?;
+
+    if input.trim().eq_ignore_ascii_case("y") || input.trim().eq_ignore_ascii_case("yes") {
+        return Ok(true);
+    }
+
+    Ok(def)
 }
 
 #[cfg(test)]

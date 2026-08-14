@@ -1,18 +1,17 @@
 use crate::buffer::Buffer;
 use crate::errors::ProbeError;
 use crate::macros::test_flag;
-use crate::macros::{bpf_target_code, not_bpf_target_code};
-use crate::uuid::{TaskUuid, Uuid};
+use crate::option::BpfOption;
+use crate::uuid::{ProcUuid, Uuid};
 use kunai_macros::{BpfError, StrEnum};
 
-not_bpf_target_code! {
-    mod user;
-    pub use user::*;
-}
+#[cfg(feature = "user")]
+mod user;
+#[cfg(feature = "user")]
+pub use user::*;
 
-bpf_target_code! {
-    mod bpf;
-}
+#[cfg(target_arch = "bpf")]
+mod bpf;
 
 mod events;
 pub use events::*;
@@ -51,9 +50,10 @@ impl From<Error> for ProbeError {
 }
 
 #[repr(u32)]
-#[derive(StrEnum, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(StrEnum, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Type {
     #[str("unknown")]
+    #[default]
     Unknown = 0,
 
     // process events
@@ -61,10 +61,11 @@ pub enum Type {
     Execve,
     #[str("execve_script")]
     ExecveScript,
-    #[str("task_sched")]
-    TaskSched,
+    // there is hole here on purpose
+    // it used to be the spot of task_sched
+    // but it didn't aim at being configurable
     #[str("exit")]
-    Exit,
+    Exit = 4, // we start at 4 as we moved one event type
     #[str("exit_group")]
     ExitGroup,
     #[str("clone")]
@@ -73,6 +74,8 @@ pub enum Type {
     Prctl,
     #[str("kill")]
     Kill,
+    #[str("ptrace")]
+    Ptrace,
 
     // stuff loaded in kernel
     #[str("init_module")]
@@ -81,8 +84,6 @@ pub enum Type {
     BpfProgLoad,
     #[str("bpf_socket_filter")]
     BpfSocketFilter,
-    //#[str("bpf_socket_prog")]
-    //BpfSocketProg,
 
     // memory stuffs
     #[str("mprotect_exec")]
@@ -112,8 +113,13 @@ pub enum Type {
     FileRename,
     #[str("file_unlink")]
     FileUnlink,
-    #[str("write_and_close")]
-    WriteAndClose,
+    #[str("write_close")]
+    WriteClose,
+    #[str("file_create")]
+    FileCreate,
+
+    #[str("io_uring_sqe")]
+    IoUringSqe = 100,
 
     // specific userland events
     // those should never be used in eBPF
@@ -122,27 +128,44 @@ pub enum Type {
 
     // Materialize the end of configurable events
     #[str("end_configurable")]
-    EndConfigurable = 1000,
+    EndConfigurable = 999,
 
-    // specific events
+    // Following events are not configurable but may
+    // be filterable
+
+    // !!! Events NOT configurable but filterable
+
+    // error event
+    #[str("error")]
+    Error,
+
+    // !!! Events NOT configurable and NOT filterable
+
+    // Agent events types are not configurable
+    // but must have a fixed id
+
+    // lost events
+    #[str("event_loss")]
+    Loss = 1100,
+
+    // start event
+    #[str("start")]
+    Start,
+
+    // specific events which are never displayed
+    // do not need a fixed identifier
     #[str("correlation")]
     Correlation,
     #[str("cache_hash")]
     CacheHash,
-    #[str("error")]
-    Error,
+    #[str("log")]
+    Log,
     #[str("syscore_resume")]
     SyscoreResume,
 
     // !!! all new event types must be put before max
     #[str("max")]
     Max,
-}
-
-impl Default for Type {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl Type {
@@ -164,18 +187,20 @@ pub struct Namespaces {
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TaskInfo {
+    // this flag is used/set in userland only
+    pub zombie: bool,
     pub flags: u32,
     pub comm: [u8; COMM_SIZE],
     pub uid: u32,
     pub gid: u32,
-    // task group id
+    // task group id in kernel or pid in userland
     // when program is single threaded tgid == pid
     pub tgid: i32,
-    // task pid -> pid of the thread
+    // task pid -> pid of the thread == thread id
     pub pid: i32,
     // task group uuid -> used to group tasks
-    pub tg_uuid: TaskUuid,
-    pub namespaces: Option<Namespaces>,
+    pub tg_uuid: ProcUuid,
+    pub namespaces: BpfOption<Namespaces>,
     pub start_time: u64,
 }
 
@@ -199,11 +224,10 @@ impl TaskInfo {
         self.tg_uuid.random = rand;
     }
 
-    not_bpf_target_code! {
-        #[inline(always)]
-        pub fn comm_string(&self) -> std::string::String {
-            self.comm_str().into()
-        }
+    #[cfg(feature = "user")]
+    #[inline(always)]
+    pub fn comm_string(&self) -> std::string::String {
+        self.comm_str().into()
     }
 }
 
@@ -218,10 +242,10 @@ pub struct EventInfo {
     // event uuid
     pub uuid: Uuid,
     // identify batch number (set in userland)
-    pub batch: usize,
-    // time elapsed since system boot in nanoseconds.
-    // The time during the system was suspended is included.
-    // set by using bpf_ktime_get_boot_ns()
+    pub batch: u64,
+    // Time elapsed since system boot in nanoseconds.
+    // Does not include time the system was suspended.
+    // Set by using bpf_ktime_get_ns()
     pub timestamp: u64,
 }
 
@@ -232,8 +256,12 @@ impl EventInfo {
         self.parent.set_uuid_random(rand);
     }
 
-    pub fn switch_type(&mut self, new: Type) {
+    pub fn with_type(&mut self, new: Type) {
         self.etype = new
+    }
+
+    pub fn batch(&mut self, batch: u64) {
+        self.batch = batch
     }
 }
 
@@ -285,9 +313,14 @@ impl<T> Event<T> {
     }
 
     #[inline]
-    pub fn switch_type(mut self, new: Type) -> Self {
-        // we record original event type
-        self.info.switch_type(new);
+    pub fn with_type(mut self, new: Type) -> Self {
+        self.info.with_type(new);
+        self
+    }
+
+    #[inline]
+    pub fn batch(&mut self, batch: u64) -> &mut Self {
+        self.info.batch(batch);
         self
     }
 }
@@ -296,34 +329,22 @@ impl<T> Event<T> {
 mod test {
     use super::*;
 
-    #[repr(C)]
-    pub struct ExecveData {
-        pub foo: u32,
-        pub bar: u32,
-    }
-
-    pub type ExecveEvent = Event<ExecveData>;
-
     #[test]
     fn test_encode_decode() {
-        let mut execve = unsafe { std::mem::zeroed::<ExecveEvent>() };
-        execve.data.foo = 42;
-        execve.data.bar = 4242;
-        execve.info.etype = Type::Execve;
-        let b = execve.encode();
+        let mut exit = unsafe { std::mem::zeroed::<ExitEvent>() };
+        exit.data.error_code = 42;
+        exit.info.etype = Type::Exit;
+
+        let b = exit.encode();
         println!("b.len()={}", b.len());
 
-        let mut d = EncodedEvent::from_bytes(b);
-        let info = unsafe { d.info() }.unwrap();
-        assert!(matches!(info.etype, Type::Execve));
+        let EbpfEvent::Exit(d) = EbpfEvent::from_sample(&b[..3], &b[3..]).unwrap() else {
+            panic!("wrong event deserialized")
+        };
 
-        let dec_execve = unsafe { d.as_mut_event_with_data::<ExecveData>() }.unwrap();
+        let info = &d.info;
+        assert!(matches!(info.etype, Type::Exit));
 
-        assert_eq!(dec_execve.data.foo, 42);
-        assert_eq!(dec_execve.data.bar, 4242);
-        dec_execve.data.foo = 342;
-        // we check that modifying the event also modified the bytes in the vector
-        let mod_execve = unsafe { d.as_event_with_data::<ExecveData>() }.unwrap();
-        assert_eq!(mod_execve.data.foo, 342);
+        assert_eq!(d.data.error_code, 42);
     }
 }

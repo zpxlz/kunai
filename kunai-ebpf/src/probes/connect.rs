@@ -1,20 +1,35 @@
 use super::*;
 
-use aya_ebpf::{cty::c_int, programs::ProbeContext};
+use aya_ebpf::{
+    cty::c_int,
+    programs::{ProbeContext, RetProbeContext},
+};
 use co_re::task_struct;
 use kunai_common::{
     kprobe::{KProbeEntryContext, ProbeFn},
     net::{SockAddr, SocketInfo},
 };
 
+/// match-proto:v5.0:net/socket.c:int __sys_connect(int fd, struct sockaddr __user *uservaddr, int addrlen)
+/// match-proto:latest:net/socket.c:int __sys_connect(int fd, struct sockaddr __user *uservaddr, int addrlen)
 #[kprobe(function = "__sys_connect")]
 pub fn net_enter_sys_connect(ctx: ProbeContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     unsafe { ignore_result!(ProbeFn::net_sys_connect.save_ctx(&ctx)) }
     0
 }
 
+/// match-proto:v5.0:net/socket.c:int __sys_connect(int fd, struct sockaddr __user *uservaddr, int addrlen)
+/// match-proto:latest:net/socket.c:int __sys_connect(int fd, struct sockaddr __user *uservaddr, int addrlen)
 #[kretprobe(function = "__sys_connect")]
-pub fn net_exit_sys_connect(ctx: ProbeContext) -> u32 {
+pub fn net_exit_sys_connect(ctx: RetProbeContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     let rc = match unsafe {
         ProbeFn::net_sys_connect
             .restore_ctx()
@@ -35,9 +50,9 @@ const EINPROGRESS: i32 = 115;
 
 unsafe fn try_exit_connect(
     entry_ctx: &mut KProbeEntryContext,
-    exit_ctx: &ProbeContext,
+    exit_ctx: &RetProbeContext,
 ) -> ProbeResult<()> {
-    let rc = exit_ctx.ret().unwrap_or(-1);
+    let rc: c_int = exit_ctx.ret();
 
     let entry_ctx = &entry_ctx.probe_context();
     let fd: c_int = kprobe_arg!(entry_ctx, 0)?;

@@ -1,16 +1,31 @@
-use aya_ebpf::programs::ProbeContext;
+use aya_ebpf::{
+    cty::c_int,
+    programs::{ProbeContext, RetProbeContext},
+};
 use kunai_common::{co_re::sock_fprog_kern, kprobe::ProbeFn, net::SocketInfo};
 
 use super::*;
 
+/// match-proto:v5.0:net/core/filter.c:static int __sk_attach_prog(struct bpf_prog *prog, struct sock *sk)
+/// match-proto:latest:net/core/filter.c:static int __sk_attach_prog(struct bpf_prog *prog, struct sock *sk)
 #[kprobe(function = "__sk_attach_prog")]
 pub fn sk_enter_sk_attach_prog(ctx: ProbeContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     unsafe { ignore_result!(ProbeFn::sk_sk_attach_prog.save_ctx(&ctx)) }
     0
 }
 
+/// match-proto:v5.0:net/core/filter.c:static int __sk_attach_prog(struct bpf_prog *prog, struct sock *sk)
+/// match-proto:latest:net/core/filter.c:static int __sk_attach_prog(struct bpf_prog *prog, struct sock *sk)
 #[kretprobe(function = "__sk_attach_prog")]
-pub fn sk_exit_sk_attach_prog(exit_ctx: ProbeContext) -> u32 {
+pub fn sk_exit_sk_attach_prog(exit_ctx: RetProbeContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     let rc = match unsafe {
         ProbeFn::sk_sk_attach_prog
             .restore_ctx()
@@ -35,14 +50,26 @@ pub fn sk_exit_sk_attach_prog(exit_ctx: ProbeContext) -> u32 {
     rc
 }
 
+/// match-proto:v5.0:net/core/sock_reuseport.c:int reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog)
+/// match-proto:latest:net/core/sock_reuseport.c:int reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog)
 #[kprobe(function = "reuseport_attach_prog")]
 pub fn sk_enter_reuseport_attach_prog(ctx: ProbeContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     unsafe { ignore_result!(ProbeFn::sk_reuseport_attach_prog.save_ctx(&ctx)) }
     0
 }
 
+/// match-proto:v5.0:net/core/sock_reuseport.c:int reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog)
+/// match-proto:latest:net/core/sock_reuseport.c:int reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog)
 #[kretprobe(function = "reuseport_attach_prog")]
-pub fn sk_exit_reuseport_attach_prog(exit_ctx: ProbeContext) -> u32 {
+pub fn sk_exit_reuseport_attach_prog(exit_ctx: RetProbeContext) -> u32 {
+    if is_current_loader_task() {
+        return 0;
+    }
+
     let rc = match unsafe {
         ProbeFn::sk_reuseport_attach_prog
             .restore_ctx()
@@ -69,11 +96,11 @@ pub fn sk_exit_reuseport_attach_prog(exit_ctx: ProbeContext) -> u32 {
 
 #[inline(always)]
 unsafe fn handle_socket_attach_prog(
-    exit_ctx: &ProbeContext,
+    exit_ctx: &RetProbeContext,
     prog: co_re::bpf_prog,
     sk: co_re::sock,
 ) -> ProbeResult<()> {
-    let rc = exit_ctx.ret().unwrap_or(-1);
+    let rc: c_int = exit_ctx.ret();
 
     let orig = core_read_kernel!(prog, orig_prog)?;
     let filter = core_read_kernel!(orig, filter)?;
@@ -106,7 +133,7 @@ unsafe fn handle_socket_attach_prog(
     }
 
     //handle loading of regular bpf program
-    warn_msg!(exit_ctx, "bpf program attached to socket not yet supported");
+    warn!(exit_ctx, "bpf program attached to socket not yet supported");
 
     Ok(())
 }

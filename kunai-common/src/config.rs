@@ -1,13 +1,12 @@
-use crate::{bpf_events, macros::bpf_target_code, macros::not_bpf_target_code};
+use crate::bpf_events;
 
-not_bpf_target_code! {
-    mod user;
-}
+#[cfg(feature = "user")]
+mod user;
 
-bpf_target_code! {
-    mod bpf;
-    pub use bpf::*;
-}
+#[cfg(target_arch = "bpf")]
+mod bpf;
+#[cfg(target_arch = "bpf")]
+pub use bpf::*;
 
 // analyzer does not see both target so we can allow dead code
 // to prevent warnings to happen
@@ -20,8 +19,15 @@ pub struct Loader {
     pub tgid: u32,
 }
 
-const FILTER_SIZE: usize = bpf_events::Type::Max as usize;
+// FILTER_SIZE should not go beyond configurable event types
+// otherwise we might prevent some wanted events (not configurable)
+// from being processed
+const FILTER_SIZE: usize = bpf_events::Type::EndConfigurable as usize;
 
+/// A structure carrying on/off information about
+/// Kunai events. Only events which are configurable
+/// (with id below [bpf_events::Type::EndConfigurable])
+/// can be configured.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Filter {
@@ -29,28 +35,51 @@ pub struct Filter {
 }
 
 impl Filter {
+    /// Creates a [Filter] with all events enabled
     pub fn all_enabled() -> Self {
         Self {
             enabled: [true; FILTER_SIZE],
         }
     }
 
+    /// Creates a [Filter] with all events disabled
     pub fn all_disabled() -> Self {
         Self {
             enabled: [false; FILTER_SIZE],
         }
     }
 
+    #[inline(always)]
+    fn set_value(&mut self, ty: bpf_events::Type, value: bool) {
+        // we set the value only if it already exists
+        if let Some(en) = self.enabled.get_mut(ty as usize) {
+            *en = value;
+        }
+    }
+
+    /// Disable any events of type [bpf_events::Type]
+    #[inline(always)]
     pub fn disable(&mut self, ty: bpf_events::Type) {
-        self.enabled[ty as usize] = false;
+        self.set_value(ty, false);
     }
 
+    /// Enable any events of type [bpf_events::Type]
+    #[inline(always)]
     pub fn enable(&mut self, ty: bpf_events::Type) {
-        self.enabled[ty as usize] = true;
+        self.set_value(ty, true);
     }
 
+    /// Returns `true` if event type [bpf_events::Type] is enabled
+    #[inline(always)]
     pub fn is_enabled(&self, ty: bpf_events::Type) -> bool {
-        self.enabled[ty as usize]
+        // all the event types not configurable should always be enabled
+        self.enabled.get(ty as usize).cloned().unwrap_or(true)
+    }
+
+    /// Returns `true` if event type [bpf_events::Type] is disabled
+    #[inline(always)]
+    pub fn is_disabled(&self, ty: bpf_events::Type) -> bool {
+        !self.is_enabled(ty)
     }
 }
 
@@ -59,5 +88,7 @@ impl Filter {
 pub struct BpfConfig {
     pub loader: Loader,
     pub filter: Filter,
+    pub glob_max_eps_fs: Option<u64>,
+    pub task_max_eps_fs: Option<u64>,
     pub send_data_min_len: u64,
 }
